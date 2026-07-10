@@ -54,7 +54,7 @@ SWAT-CUP is reliable, but high-volume calibration is slow when every test must b
 ## Install 安装
 
 ```powershell
-git clone https://github.com/<your-name>/swatcup-auto-calibrator.git
+git clone https://github.com/justo888777/swatcup-auto-calibrator.git
 cd swatcup-auto-calibrator
 python -m pip install -e .
 ```
