@@ -1,0 +1,3 @@
+interface:
+  display_name: "SWAT-CUP Auto Calibrator"
+  short_description: "Automate SWAT-CUP SUFI2 calibration safely."

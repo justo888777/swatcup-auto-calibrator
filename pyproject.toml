@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swatcup-auto-calibrator"
+version = "0.1.0"
+description = "GUI-free SWAT-CUP SUFI2 calibration runner with safe worker-copy parallel sampling."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+  {name = "Tao and Codex"}
+]
+keywords = ["SWAT", "SWAT-CUP", "SUFI2", "calibration", "hydrology", "sediment"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Hydrology",
+]
+
+[project.scripts]
+swatcup-auto = "swatcup_auto.runner:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["swatcup_auto*"]
