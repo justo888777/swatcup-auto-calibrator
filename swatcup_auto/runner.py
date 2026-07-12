@@ -15,22 +15,60 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-EDIT_EXTENSIONS = {"bsn", "hru", "mgt", "sol", "rte", "sub", "gw"}
+EDIT_EXTENSIONS = {"bsn", "hru", "mgt", "sol", "rte", "sub", "gw", "res"}
 SOL_LABELS = {
     "SOL_AWC": "Ave. AW Incl. Rock Frag",
     "SOL_K": "Ksat. (est.)",
     "USLE_K": "Erosion K",
 }
+RES_ARRAY_LABELS = {"OFLOWMX", "OFLOWMN", "STARG", "WURESN"}
+FIG_COMMANDS = {
+    "subbasin",
+    "route",
+    "routres",
+    "add",
+    "recmon",
+    "recday",
+    "reccnst",
+    "transfer",
+    "saveconc",
+    "finish",
+}
+FIG_FILE_PATTERN = re.compile(
+    r"\d{9}\.(?:sub|rte|swq|res|lwq|pnd|wus|dat)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
 class Parameter:
     operation: str
     name: str
+    layer_index: int | None
     extension: str
     selector: str | None
     value: float
     raw_name: str
+
+
+@dataclass(frozen=True)
+class FigNode:
+    op: str
+    node_id: int
+    object_id: int | None
+    upstream_ids: tuple[int, ...]
+    files: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ReservoirScope:
+    station_id: int
+    relation: str
+    res_file: str
+    selector: int
+    local_subbasin: int | None
+    res_node_id: int
+    upstream_node_id: int | None
 
 
 def parse_parameter(raw_name: str, value: float) -> Parameter:
@@ -40,14 +78,21 @@ def parse_parameter(raw_name: str, value: float) -> Parameter:
     operation = raw_name[0].lower()
     body = raw_name[3:]
     param_name, rest = body.split(".", 1)
-    param_name = param_name.replace("()", "")
+    layer_index = None
+    layer_match = re.fullmatch(r"([A-Za-z0-9_]+)(?:\((\d+)\))?", param_name)
+    if layer_match:
+        param_name = layer_match.group(1)
+        if layer_match.group(2):
+            layer_index = int(layer_match.group(2))
+    else:
+        param_name = param_name.replace("()", "")
 
     rest_lower = rest.lower()
     extension = next((ext for ext in sorted(EDIT_EXTENSIONS, key=len, reverse=True) if rest_lower.startswith(ext)), None)
     if extension is None:
         raise ValueError(f"Unsupported parameter extension in: {raw_name}")
     selector = rest[len(extension):].replace("_", "") or None
-    return Parameter(operation, param_name, extension, selector, value, raw_name)
+    return Parameter(operation, param_name, layer_index, extension, selector, value, raw_name)
 
 
 def parse_model_in(path: Path) -> list[Parameter]:
@@ -104,6 +149,26 @@ def subbasin_id(path: Path) -> int | None:
     return None
 
 
+def reservoir_sub_id(path: Path) -> int | None:
+    if path.suffix.lower() != ".res":
+        return None
+    try:
+        for line in path.read_text(errors="ignore").splitlines():
+            if "| RES_SUB" in line.upper():
+                return int(numeric_before_pipe(line))
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def reservoir_file_subbasin(path_or_name: Path | str) -> int | None:
+    name = Path(path_or_name).name
+    stem = Path(name).stem
+    if len(stem) >= 5 and stem[:5].isdigit():
+        return int(stem[:5])
+    return None
+
+
 def hru_first_line(project: Path, file_path: Path) -> str:
     hru_path = project / f"{file_path.stem}.hru"
     if not hru_path.exists():
@@ -116,10 +181,19 @@ def selector_matches(project: Path, file_path: Path, selector: str | None) -> bo
     if not selector:
         return True
 
-    if re.fullmatch(r"\d+(,\d+)*", selector):
-        selected = {int(x) for x in selector.split(",")}
+    if re.fullmatch(r"\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*", selector):
+        selected: set[int] = set()
+        for token in selector.split(","):
+            if "-" in token:
+                start, end = (int(x) for x in token.split("-", 1))
+                selected.update(range(min(start, end), max(start, end) + 1))
+            else:
+                selected.add(int(token))
         sid = subbasin_id(file_path)
-        return sid in selected
+        if sid in selected:
+            return True
+        rid = reservoir_sub_id(file_path)
+        return rid in selected
 
     token = f"Luse:{selector.upper()}"
     return token in hru_first_line(project, file_path)
@@ -187,6 +261,26 @@ def apply_operation(old_value: float, param: Parameter) -> float:
         new_value = min(500.0, max(0.0, new_value))
     elif param.name == "HRU_SLP":
         new_value = min(1.0, max(0.0, new_value))
+    elif param.name in {"IRESCO", "IFLOD1R", "IFLOD2R", "NDTARGR"}:
+        new_value = max(0.0, round(new_value))
+        if param.name == "IRESCO":
+            new_value = min(3.0, new_value)
+        elif param.name in {"IFLOD1R", "IFLOD2R"}:
+            new_value = min(12.0, max(1.0, new_value))
+        elif param.name == "NDTARGR":
+            new_value = min(365.0, new_value)
+    elif param.name in {"EVRSV", "WURTNF", "OFLOWMN_FPS", "STARG_FPS"}:
+        new_value = min(1.0, max(0.0, new_value))
+    elif param.name == "RES_K":
+        new_value = min(10.0, max(0.0, new_value))
+    elif param.name == "RES_RR":
+        new_value = min(500.0, max(0.0, new_value))
+    elif param.name in {"RES_VOL", "RES_PVOL", "RES_EVOL", "STARG"}:
+        new_value = min(50000.0, max(0.0, new_value))
+    elif param.name in {"OFLOWMX", "OFLOWMN"}:
+        new_value = min(1000.0, max(0.0, new_value))
+    elif param.name == "WURESN":
+        new_value = min(5000.0, max(0.0, new_value))
     elif param.name == "LAT_SED":
         new_value = max(0.0, new_value)
     elif param.name in {"CH_L1", "CH_L2"}:
@@ -277,13 +371,281 @@ def edit_sol_parameter(path: Path, backup_path: Path, param: Parameter) -> int:
         if label in body:
             prefix, _ = body.split(":", 1)
             values = sol_values(body)
-            new_values = [apply_operation(v, param) for v in values]
+            new_values = values[:]
+            if param.layer_index is None:
+                new_values = [apply_operation(v, param) for v in values]
+                count += len(new_values)
+            else:
+                value_index = param.layer_index - 1
+                if value_index >= len(values):
+                    raise RuntimeError(f"{path.name}: {param.raw_name} layer index exceeds soil layer count")
+                new_values[value_index] = apply_operation(values[value_index], param)
+                count += 1
             body = f"{prefix}:{''.join(f'{v:12.2f}' for v in new_values)}"
-            count += len(new_values)
         new_lines.append(body + newline)
 
     path.write_text("".join(new_lines), newline="")
     return count
+
+
+def res_values(line: str) -> list[float]:
+    return [float(x) for x in re.findall(r"[-+]?\d+(?:\.\d+)?(?:[Ee][-+]?\d+)?", line)]
+
+
+def format_res_array_line(values: list[float]) -> str:
+    return "".join(f"{value:10.1f}" for value in values)
+
+
+def edit_res_array_parameter(path: Path, backup_path: Path, param: Parameter) -> int:
+    lines = path.read_text(errors="ignore").splitlines(keepends=True)
+    count = 0
+    month_offset = 0
+    new_lines: list[str] = []
+    i = 0
+    label_pattern = re.compile(rf"^\s*{re.escape(param.name)}\s*:", re.IGNORECASE)
+
+    while i < len(lines):
+        line = lines[i]
+        new_lines.append(line)
+        body = line.rstrip("\n")
+        if label_pattern.search(body) and i + 1 < len(lines):
+            i += 1
+            value_line = lines[i]
+            newline = "\n" if value_line.endswith("\n") else ""
+            values = res_values(value_line)
+            if values:
+                new_values = values[:]
+                for value_index, value in enumerate(values):
+                    month_index = month_offset + value_index + 1
+                    if param.layer_index is None or param.layer_index == month_index:
+                        new_values[value_index] = apply_operation(value, param)
+                        count += 1
+                value_line = format_res_array_line(new_values) + newline
+                month_offset += len(values)
+            new_lines.append(value_line)
+        i += 1
+
+    path.write_text("".join(new_lines), newline="")
+    return count
+
+
+def edit_res_parameter(path: Path, backup_path: Path, param: Parameter) -> int:
+    if param.name in RES_ARRAY_LABELS:
+        return edit_res_array_parameter(path, backup_path, param)
+    return edit_pipe_parameter(path, backup_path, param)
+
+
+def is_fig_command(line: str) -> bool:
+    parts = line.split()
+    return bool(parts) and parts[0].lower() in FIG_COMMANDS
+
+
+def integer_tokens(parts: list[str]) -> list[int]:
+    values: list[int] = []
+    for part in parts:
+        if re.fullmatch(r"[-+]?\d+", part):
+            values.append(int(part))
+    return values
+
+
+def parse_fig(path: Path) -> dict[int, FigNode]:
+    nodes: dict[int, FigNode] = {}
+    lines = path.read_text(errors="ignore").splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        parts = line.split()
+        if not parts or parts[0].lower() not in FIG_COMMANDS:
+            index += 1
+            continue
+
+        op = parts[0].lower()
+        ints = integer_tokens(parts[1:])
+        files: tuple[str, ...] = ()
+        if index + 1 < len(lines) and not is_fig_command(lines[index + 1]):
+            files = tuple(match.group(0) for match in FIG_FILE_PATTERN.finditer(lines[index + 1]))
+
+        node: FigNode | None = None
+        if op == "subbasin" and len(ints) >= 3:
+            node = FigNode(op, ints[1], ints[2], (), files)
+        elif op == "route" and len(ints) >= 4:
+            node = FigNode(op, ints[1], ints[2], (ints[3],), files)
+        elif op == "routres" and len(ints) >= 4:
+            node = FigNode(op, ints[1], ints[2], (ints[3],), files)
+        elif op == "add" and len(ints) >= 4:
+            node = FigNode(op, ints[1], None, (ints[2], ints[3]), files)
+        elif op in {"recmon", "recday", "reccnst"} and len(ints) >= 2:
+            node = FigNode(op, ints[1], ints[2] if len(ints) >= 3 else None, (), files)
+        elif op == "saveconc" and len(ints) >= 2:
+            node = FigNode(op, ints[1], ints[2] if len(ints) >= 3 else None, (), files)
+
+        if node is not None:
+            nodes[node.node_id] = node
+        index += 1
+    return nodes
+
+
+def upstream_closure(nodes: dict[int, FigNode], start_ids: list[int]) -> set[int]:
+    seen: set[int] = set()
+    stack = list(start_ids)
+    while stack:
+        node_id = stack.pop()
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        node = nodes.get(node_id)
+        if node:
+            stack.extend(upstream for upstream in node.upstream_ids if upstream not in seen)
+    return seen
+
+
+def read_res_scalar(path: Path, name: str) -> float | None:
+    pattern = re.compile(rf"\|\s*{re.escape(name)}\b", re.IGNORECASE)
+    for line in path.read_text(errors="ignore").splitlines():
+        if pattern.search(line):
+            return numeric_before_pipe(line)
+    return None
+
+
+def read_res_array(path: Path, name: str) -> list[float]:
+    lines = path.read_text(errors="ignore").splitlines()
+    values: list[float] = []
+    label_pattern = re.compile(rf"^\s*{re.escape(name)}\s*:", re.IGNORECASE)
+    for index, line in enumerate(lines):
+        if label_pattern.search(line) and index + 1 < len(lines):
+            values.extend(res_values(lines[index + 1]))
+    return values
+
+
+def reservoir_scope(project: Path, station_ids: list[int], fig_path: Path | None = None) -> list[ReservoirScope]:
+    fig = fig_path or project / "fig.fig"
+    if not fig.exists():
+        raise FileNotFoundError(fig)
+    nodes = parse_fig(fig)
+    route_nodes_by_sub: dict[int, list[int]] = {}
+    for node in nodes.values():
+        if node.op == "route" and node.object_id is not None:
+            route_nodes_by_sub.setdefault(node.object_id, []).append(node.node_id)
+
+    scopes: list[ReservoirScope] = []
+    for station_id in station_ids:
+        upstream_ids = upstream_closure(nodes, route_nodes_by_sub.get(station_id, []))
+        for node in nodes.values():
+            if node.op != "routres":
+                continue
+            res_file = next((file for file in node.files if file.lower().endswith(".res")), "")
+            if not res_file:
+                continue
+            res_path = project / res_file
+            local_sub = None
+            upstream_id = node.upstream_ids[0] if node.upstream_ids else None
+            upstream_node = nodes.get(upstream_id) if upstream_id is not None else None
+            if upstream_node and upstream_node.op == "route":
+                local_sub = upstream_node.object_id
+            if local_sub is None:
+                local_sub = reservoir_file_subbasin(res_file)
+            selector_value = None
+            if res_path.exists():
+                scalar = read_res_scalar(res_path, "RES_SUB")
+                selector_value = int(scalar) if scalar is not None else None
+            selector_value = selector_value or local_sub or reservoir_file_subbasin(res_file)
+            if selector_value is None:
+                continue
+            relation = "local" if local_sub == station_id else "upstream" if node.node_id in upstream_ids else ""
+            if relation:
+                scopes.append(
+                    ReservoirScope(
+                        station_id=station_id,
+                        relation=relation,
+                        res_file=res_file,
+                        selector=selector_value,
+                        local_subbasin=local_sub,
+                        res_node_id=node.node_id,
+                        upstream_node_id=upstream_id,
+                    )
+                )
+    return sorted(set(scopes), key=lambda item: (item.station_id, item.relation, item.res_file))
+
+
+def station_ids_from_observed(project: Path, observed_path: Path | None = None) -> list[int]:
+    observed = read_observed_blocks(observed_path or project / "SUFI2.IN" / "observed_rch.txt")
+    station_ids: list[int] = []
+    for name in observed:
+        match = re.fullmatch(r"FLOW_OUT_(\d+)", name)
+        if match:
+            station_ids.append(int(match.group(1)))
+    return sorted(set(station_ids))
+
+
+def bounded_range(value: float, lo: float, hi: float, min_span: float = 0.0) -> tuple[float, float]:
+    lo = min(value, lo)
+    hi = max(value, hi)
+    if min_span and hi - lo < min_span:
+        half = min_span / 2.0
+        lo = value - half
+        hi = value + half
+    return lo, hi
+
+
+def conservative_res_parameter_rows(project: Path, scopes: list[ReservoirScope]) -> list[tuple[str, float, float]]:
+    rows: list[tuple[str, float, float]] = []
+    seen_files: set[str] = set()
+    for scope in scopes:
+        if scope.res_file in seen_files:
+            continue
+        seen_files.add(scope.res_file)
+        res_path = project / scope.res_file
+        if not res_path.exists():
+            continue
+        selector = scope.selector
+        res_rr = read_res_scalar(res_path, "RES_RR")
+        if res_rr is not None and res_rr > 0:
+            rows.append((f"v__RES_RR.res________{selector}", max(0.0, res_rr * 0.75), res_rr * 1.25))
+
+        ndtargr = read_res_scalar(res_path, "NDTARGR")
+        if ndtargr is not None and ndtargr > 0:
+            rows.append((f"v__NDTARGR.res________{selector}", max(1.0, ndtargr * 0.70), min(365.0, ndtargr * 1.30)))
+
+        evrsv = read_res_scalar(res_path, "EVRSV")
+        if evrsv is not None:
+            rows.append((f"v__EVRSV.res________{selector}", max(0.30, evrsv - 0.10), min(1.00, evrsv + 0.10)))
+
+        res_k = read_res_scalar(res_path, "RES_K")
+        if res_k is not None:
+            if res_k == 0:
+                rows.append((f"v__RES_K.res________{selector}", 0.0, 0.05))
+            else:
+                rows.append((f"v__RES_K.res________{selector}", max(0.0, res_k * 0.50), min(1.0, res_k * 2.0)))
+
+        starg = [value for value in read_res_array(res_path, "STARG") if value > 0]
+        if starg:
+            center = sum(starg) / len(starg)
+            pvol = read_res_scalar(res_path, "RES_PVOL") or center
+            evol = read_res_scalar(res_path, "RES_EVOL") or max(center, pvol)
+            rows.append(
+                (
+                    f"v__STARG.res________{selector}",
+                    max(0.0, max(center * 0.90, pvol * 0.60)),
+                    min(evol, max(center * 1.10, pvol * 0.80)),
+                )
+            )
+
+        wuresn = read_res_array(res_path, "WURESN")
+        nonzero_wuresn = [(index + 1, value) for index, value in enumerate(wuresn) if value > 0]
+        for month, value in nonzero_wuresn:
+            rows.append((f"v__WURESN({month}).res________{selector}", max(0.0, value * 0.70), value * 1.30))
+        if nonzero_wuresn:
+            wurtnf = read_res_scalar(res_path, "WURTNF")
+            if wurtnf is not None:
+                rows.append((f"v__WURTNF.res________{selector}", max(0.0, wurtnf - 0.20), min(1.0, wurtnf + 0.20)))
+
+        for label in ("OFLOWMN", "OFLOWMX"):
+            values = read_res_array(res_path, label)
+            nonzero = [value for value in values if value > 0]
+            if nonzero:
+                center = sum(nonzero) / len(nonzero)
+                rows.append((f"v__{label}.res________{selector}", max(0.0, center * 0.50), center * 1.50))
+    return rows
 
 
 def apply_parameters(project: Path, params: list[Parameter]) -> dict[str, int]:
@@ -317,6 +679,8 @@ def apply_parameters(project: Path, params: list[Parameter]) -> dict[str, int]:
             backup_path = backup / path.name
             if param.extension == "sol":
                 edited += edit_sol_parameter(path, backup_path, param)
+            elif param.extension == "res":
+                edited += edit_res_parameter(path, backup_path, param)
             else:
                 edited += edit_pipe_parameter(path, backup_path, param)
         counts[param.raw_name] = edited
@@ -446,6 +810,28 @@ def sediment_shape_score(result: dict[str, dict[str, float]]) -> float:
     return sed["r2"] + sed["nse"] + 0.2 * sed["kge"] - 0.5 * bias_penalty - flow_penalty
 
 
+def hhb_flow_score(result: dict[str, dict[str, float]]) -> float:
+    rows = list(result.values())
+    mean_kge = sum(row["kge"] for row in rows) / len(rows)
+    bounded_nse = [max(-2.0, min(1.0, row["nse"])) for row in rows]
+    mean_nse = sum(bounded_nse) / len(bounded_nse)
+    negative_nse_penalty = sum(max(0.0, -row["nse"]) for row in rows) / len(rows)
+    negative_kge_penalty = sum(max(0.0, -row["kge"]) for row in rows) / len(rows)
+    bias_penalty = sum(min(abs(row["pbias"]) / 100.0, 2.0) for row in rows) / len(rows)
+    focus = result.get("FLOW_OUT_2")
+    focus_penalty = 0.0
+    if focus:
+        focus_penalty = 0.20 * max(0.0, -focus["kge"]) + 0.10 * max(0.0, -focus["nse"])
+    return (
+        0.70 * mean_kge
+        + 0.30 * mean_nse
+        - 0.35 * negative_nse_penalty
+        - 0.20 * negative_kge_penalty
+        - 0.08 * bias_penalty
+        - focus_penalty
+    )
+
+
 def print_result(result: dict[str, dict[str, float]]) -> None:
     for name, row in result.items():
         print(
@@ -493,6 +879,8 @@ def sample_values(
 def score_result(result: dict[str, dict[str, float]], score_mode: str, sediment_weight: float) -> float:
     if score_mode == "sediment":
         return sediment_shape_score(result)
+    if score_mode == "hhb_flow":
+        return hhb_flow_score(result)
     return combined_score(result, sediment_weight=sediment_weight)
 
 
@@ -584,7 +972,6 @@ def copy_worker_project(source_project: Path, worker_root: Path, worker_index: i
             "direct_edit_log.txt",
             "output.*",
             "swat_output.txt",
-            "*.tmp",
         )
         shutil.copytree(source_project, dest, ignore=ignore)
     (dest / "SUFI2.OUT").mkdir(exist_ok=True)
@@ -738,6 +1125,61 @@ def command_shrink(args: argparse.Namespace) -> None:
     print(f"Wrote narrowed par_inf.txt to {out_path}")
 
 
+def parse_station_arg(value: str | None) -> list[int]:
+    if not value:
+        return []
+    station_ids: set[int] = set()
+    for token in value.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start, end = (int(part) for part in token.split("-", 1))
+            station_ids.update(range(min(start, end), max(start, end) + 1))
+        else:
+            station_ids.add(int(token))
+    return sorted(station_ids)
+
+
+def command_reservoir_scope(args: argparse.Namespace) -> None:
+    project = Path(args.project).resolve()
+    observed_path = Path(args.observed_rch).resolve() if args.observed_rch else None
+    station_ids = parse_station_arg(args.stations) or station_ids_from_observed(project, observed_path)
+    if not station_ids:
+        raise ValueError("No station ids supplied and no FLOW_OUT_* blocks found in observed_rch.txt")
+
+    fig_path = Path(args.fig).resolve() if args.fig else project / "fig.fig"
+    scopes = reservoir_scope(project, station_ids, fig_path)
+    if scopes:
+        print("station,relation,res_file,selector,local_subbasin,res_node,upstream_node")
+        for scope in scopes:
+            print(
+                f"{scope.station_id},{scope.relation},{scope.res_file},{scope.selector},"
+                f"{scope.local_subbasin if scope.local_subbasin is not None else ''},"
+                f"{scope.res_node_id},{scope.upstream_node_id if scope.upstream_node_id is not None else ''}"
+            )
+    else:
+        print("No local or upstream reservoirs found for requested stations.")
+
+    rows = conservative_res_parameter_rows(project, scopes)
+    if args.out_par_inf:
+        out_path = Path(args.out_par_inf).resolve()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        lines = [
+            f"{len(rows):<9d}: Number of Parameters",
+            f"{args.runs:<9d}: number of simulations",
+            "",
+        ]
+        lines.extend(f"{name:<58} {lo:.6f}   {hi:.6f}" for name, lo, hi in rows)
+        out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(f"Wrote conservative reservoir par_inf rows to {out_path}")
+    elif rows:
+        print("")
+        print("Conservative reservoir parameter rows:")
+        for name, lo, hi in rows:
+            print(f"{name:<58} {lo:.6f}   {hi:.6f}")
+
+
 def add_sampling_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--project", required=True)
     parser.add_argument("--runs", type=int, default=10)
@@ -762,7 +1204,7 @@ def build_parser() -> argparse.ArgumentParser:
     sample = sub.add_parser("sample")
     add_sampling_arguments(sample)
     sample.add_argument("--sediment-weight", type=float, default=3.0)
-    sample.add_argument("--score-mode", choices=["kge", "sediment"], default="kge")
+    sample.add_argument("--score-mode", choices=["kge", "sediment", "hhb_flow"], default="kge")
     sample.add_argument("--out-csv", required=True)
     sample.add_argument("--observed-rch")
     sample.add_argument("--workers", type=int, default=1)
@@ -783,6 +1225,15 @@ def build_parser() -> argparse.ArgumentParser:
     shrink.add_argument("--factor", type=float, default=0.2)
     shrink.add_argument("--score-column", default="score")
     shrink.set_defaults(func=command_shrink)
+
+    reservoir_parser = sub.add_parser("reservoir-scope")
+    reservoir_parser.add_argument("--project", required=True)
+    reservoir_parser.add_argument("--stations", help="Comma/range station ids, e.g. 2,7,14-17. Defaults to FLOW_OUT_* in observed_rch.txt.")
+    reservoir_parser.add_argument("--observed-rch")
+    reservoir_parser.add_argument("--fig")
+    reservoir_parser.add_argument("--out-par-inf")
+    reservoir_parser.add_argument("--runs", type=int, default=50)
+    reservoir_parser.set_defaults(func=command_reservoir_scope)
     return parser
 
 

@@ -1,14 +1,13 @@
 ---
 name: swatcup-auto-calibrator
-description: Use when automating SWAT-CUP SUFI2 calibration without the GUI, reproducing a best run from model.in, generating par_val.txt sampling plans, running serial or worker-copy parallel SWAT simulations, narrowing par_inf.txt, or reporting R2 NSE KGE PBIAS metrics for flow or sediment stations.
-license: MIT
+description: Use when automating SWAT-CUP SUFI2 calibration without the GUI, reproducing a best run from model.in, generating par_val.txt sampling plans, running serial or worker-copy parallel SWAT simulations, narrowing par_inf.txt, reporting R2 NSE KGE PBIAS metrics, or performing conservative reservoir .res co-calibration by reading fig.fig upstream/local relationships.
 ---
 
 # SWAT-CUP Auto Calibrator
 
 ## Overview
 
-This skill helps Codex automate SWAT-CUP/SUFI2 calibration by treating the project folder as a file protocol instead of driving the GUI. Use the included Python runner for parameter editing, SWAT execution, SUFI2 output extraction, metric calculation, sampling, and next-round range narrowing.
+This skill helps Codex automate SWAT-CUP/SUFI2 calibration by treating the project folder as a file protocol instead of driving the GUI. Use the included Python runner for parameter editing, SWAT execution, SUFI2 output extraction, metric calculation, sampling, next-round range narrowing, and conservative reservoir `.res` co-calibration.
 
 ## Workflow
 
@@ -21,7 +20,8 @@ This skill helps Codex automate SWAT-CUP/SUFI2 calibration by treating the proje
 4. Use `--workers N` only when there is enough disk space for N full project copies.
 5. For SWAT-CUP GUI 95PPU, use `plan` to generate `par_val.txt` and copy it into `SUFI2.IN/par_val.txt`.
 6. Use `shrink` after a sample CSV to build a narrower `par_inf.txt` for the next iteration.
-7. Report station-level R2, NSE, KGE, and PBIAS. For sediment work, keep sediment metrics separate from the combined score.
+7. For reservoir-affected stations, run `reservoir-scope` first. It reads `fig.fig`, lists local/upstream reservoirs, and can generate conservative `.res` parameter rows for no-GUI sampling.
+8. Report station-level R2, NSE, KGE, and PBIAS. For sediment work, keep sediment metrics separate from the combined score.
 
 ## Safety Rules
 
@@ -31,6 +31,8 @@ This skill helps Codex automate SWAT-CUP/SUFI2 calibration by treating the proje
 - Use `--refresh-workers` after changing the source project, observed file, `par_inf.txt`, `par_val.txt`, or executable set.
 - Prefer `DirectBase/` over `Backup/` because it represents the clean non-cumulative baseline for direct editing.
 - Keep calibration and validation observed files in clearly named files or folders.
+- Do not put `.res` parameters into a SWAT-CUP GUI run unless the GUI version is known to apply them. For GUI runs, write fixed reservoir files into both the project root and `Backup/`, then keep GUI `par_inf.txt` to supported non-RES parameters.
+- Keep reservoir changes physically mild. Do not sample `IRESCO` unless the user provides an operational reason; prefer conservative ranges around current `RES_RR`, `NDTARGR`, `STARG`, `EVRSV`, `RES_K`, existing `WURESN` months, and non-zero `OFLOWMN/OFLOWMX`.
 
 ## Commands
 
@@ -54,6 +56,10 @@ python -m swatcup_auto plan --project "D:\path\Best_CUP.Sufi2.SwatCup" --runs 20
 
 ```powershell
 python -m swatcup_auto shrink --par-inf ".\SUFI2.IN\par_inf.txt" --results-csv ".\results\round1.csv" --factor 0.20 --out-par-inf ".\par_inf_round2.txt"
+```
+
+```powershell
+python -m swatcup_auto reservoir-scope --project "D:\path\Best_CUP.Sufi2.SwatCup" --stations "2,7,14" --out-par-inf ".\reservoir_par_inf.txt" --runs 50
 ```
 
 ## References

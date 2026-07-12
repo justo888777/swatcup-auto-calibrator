@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "swatcup-auto-calibrator"
-version = "0.1.0"
-description = "GUI-free SWAT-CUP SUFI2 calibration runner with safe worker-copy parallel sampling."
+version = "1.0.1"
+description = "GUI-free SWAT-CUP SUFI2 calibration runner with safe worker-copy parallel sampling and conservative reservoir co-calibration."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}

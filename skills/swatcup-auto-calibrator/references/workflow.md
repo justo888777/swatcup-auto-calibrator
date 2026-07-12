@@ -9,9 +9,11 @@ Use this workflow for SWAT-CUP SUFI2 projects when the user wants calibration wi
 3. Check `SUFI2.IN/observed_rch.txt` to identify stations and variables.
 4. Run a single reproduction using a known `model.in` before sampling.
 5. Run small sampling first, usually 10 to 50 runs, to verify that metrics and outputs are parsed correctly.
-6. Increase to larger sampling only after outputs and objective metrics are plausible.
-7. For paper-ready work, split observed files by calibration and validation periods and evaluate both periods explicitly.
-8. For SWAT-CUP GUI 95PPU, generate `par_val.txt` with `plan`, then run the full SWAT-CUP workflow in the GUI if needed.
+6. When a station may be reservoir affected, run `reservoir-scope` with the station ids. Include only reservoirs that the command reports as local or upstream from `fig.fig`.
+7. Keep `.res` co-calibration mild: do not vary `IRESCO` by default; vary only physically interpretable release, target storage, evaporation, seepage, existing water-use months, and existing outflow constraints.
+8. Increase to larger sampling only after outputs and objective metrics are plausible.
+9. For paper-ready work, split observed files by calibration and validation periods and evaluate both periods explicitly.
+10. For SWAT-CUP GUI 95PPU, generate `par_val.txt` with `plan`, then run the full SWAT-CUP workflow in the GUI if needed. If the GUI cannot apply `.res` fields, write fixed reservoir files into both the project root and `Backup/` and keep `par_inf.txt` GUI-compatible.
 
 ## 中文
 

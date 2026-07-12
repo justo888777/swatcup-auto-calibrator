@@ -26,6 +26,7 @@ SWAT-CUP is reliable, but high-volume calibration is slow when every test must b
 - Automatic best-run export as `*.best_model.in`.
 - Next-round `par_inf.txt` narrowing from a result CSV.
 - Metrics: R2, NSE, KGE, PBIAS.
+- Conservative `.res` reservoir co-calibration for no-GUI runs, with `fig.fig` upstream/local scope discovery.
 - Codex skill included under `skills/swatcup-auto-calibrator/`.
 
 - 支持从 `model.in` 或 `par_val.txt` 单次复现。
@@ -119,6 +120,16 @@ swatcup-auto shrink `
   --out-par-inf ".\results\par_inf_round2.txt"
 ```
 
+Find reservoirs that can affect selected observation subbasins and generate conservative `.res` ranges:
+
+```powershell
+swatcup-auto reservoir-scope `
+  --project "D:\Projects\HHB\Best_CUP.Sufi2.SwatCup" `
+  --stations "2,7,14" `
+  --out-par-inf ".\results\reservoir_scope_par_inf.txt" `
+  --runs 50
+```
+
 ## Parallel Design 并行设计
 
 Do not run multiple SWAT simulations in the same folder. SWAT and SUFI2 write fixed file names, so shared-folder parallelism will corrupt runs.
@@ -140,7 +151,15 @@ The runner supports common SWAT-CUP SUFI2 parameter forms:
 - `r__PARAM.ext...`: relative change, `old * (1 + value)`.
 - `a__PARAM.ext...`: additive change, `old + value`.
 
-Supported SWAT input extensions include `.bsn`, `.hru`, `.mgt`, `.sol`, `.rte`, `.sub`, and `.gw`.
+Supported SWAT input extensions include `.bsn`, `.hru`, `.mgt`, `.sol`, `.rte`, `.sub`, `.gw`, and `.res`.
+
+Reservoir parameters use the same SUFI2-style syntax:
+
+- `v__RES_RR.res________20`: replace a scalar field in the reservoir whose `RES_SUB` or file subbasin selector is `20`.
+- `v__STARG.res________20`: replace all 12 monthly target storage values.
+- `v__WURESN(4).res________20`: replace only April consumptive reservoir withdrawal.
+
+The `reservoir-scope` command reads `fig.fig` and only proposes `.res` rows for reservoirs that are local to or upstream of the requested observation subbasins. It intentionally does not sample `IRESCO` by default. Generated ranges are conservative and based on current reservoir settings: release rates, target storage, evaporation coefficient, bottom seepage, existing water-use months, and non-zero outflow constraints are adjusted mildly rather than opened to arbitrary data-fitting ranges.
 
 ## Codex Skill
 
