@@ -1,5 +1,7 @@
 # SWAT-CUP Auto Calibrator
 
+English | [简体中文](README_CN.md)
+
 Process-aware, GUI-free SWAT-CUP/SUFI2 calibration for multi-station projects.
 
 无需持续操作 SWAT-CUP 图形界面。工具可直接复现 `model.in`、在相互隔离的工程副本中采样、计算逐站 R2/NSE/KGE/PBIAS 与时序诊断指标，并准备可由原生 BAT 和 GUI 继续运行的工程。
