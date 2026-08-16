@@ -1,184 +1,168 @@
 # SWAT-CUP Auto Calibrator
 
-GUI-free SWAT-CUP/SUFI2 calibration automation with safe parallel sampling.
+Process-aware, GUI-free SWAT-CUP/SUFI2 calibration for multi-station projects.
 
-无需打开 SWAT-CUP 图形界面，直接读写 SUFI2 工程文件、运行 `swat.exe` 和 `SUFI2_extract_rch.exe`，计算 R2、NSE、KGE、PBIAS，并支持安全并行采样。
+无需持续操作 SWAT-CUP 图形界面。工具可直接复现 `model.in`、在相互隔离的工程副本中采样、计算逐站 R2/NSE/KGE/PBIAS 与时序诊断指标，并准备可由原生 BAT 和 GUI 继续运行的工程。
 
-## Why
+## Version 1.1.0
 
-SWAT-CUP is reliable, but high-volume calibration is slow when every test must be driven through the GUI. This project treats a SWAT-CUP SUFI2 folder as a file-based protocol:
+This release expands the original runner into a complete calibration and delivery workflow:
 
-1. Restore editable SWAT input files from `DirectBase/` or `Backup/`.
-2. Apply parameter values from `model.in`, `par_inf.txt`, or generated samples.
-3. Run `swat.exe`.
-4. Run `SUFI2_extract_rch.exe`.
-5. Compare `SUFI2.OUT/*.txt` with `SUFI2.IN/observed_rch.txt`.
-6. Rank runs by KGE or a sediment-focused score.
+- Multi-station process diagnostics: correlation, log-NSE, monthly climatology, lag, peak offset, peak capture, low-flow ratio, and false-zero detection.
+- Saved per-run hydrographs and strict station-specific 95PPU ensemble construction.
+- `fig.fig` topology audit for station dependencies, record inputs, `.wus` withdrawals, and local/upstream reservoirs.
+- Conservative joint `.wus`/`.res` calibration. Monthly reservoir targets, outflow limits, and withdrawals keep their seasonal structure instead of being flattened to one annual value.
+- Per-station weights and NSE/KGE acceptance thresholds for candidate selection.
+- Failed-run accounting and retry limits so a requested sample count means successful simulations.
+- Native GUI project checks, baked-input synchronization, and BAT smoke-test validation.
 
-这个工具的设计来自滇池案例中的成功复现：跳过 GUI，直接操作 SWAT-CUP 工程目录。并行时每个 worker 都复制一份完整工程，避免多个进程同时覆盖同一个 `model.in`、`SUFI2.OUT` 或 SWAT 输出文件。
+1.1.0 removes the old basin-specific `sediment` and `hhb_flow` score modes. Use equal or explicit variable weights with `kge`, or use `multisite_timeseries` for process-aware multi-station search.
 
-## Features 功能
+## Safety Model
 
-- Single-run reproduction from `model.in` or one row in `par_val.txt`.
-- Serial or parallel parameter sampling.
-- Worker-copy parallelism: each process owns an independent SWAT-CUP project copy.
-- `par_val.txt` planning for users who still want to run 95PPU in SWAT-CUP.
-- Automatic best-run export as `*.best_model.in`.
-- Next-round `par_inf.txt` narrowing from a result CSV.
-- Metrics: R2, NSE, KGE, PBIAS.
-- Conservative `.res` reservoir co-calibration for no-GUI runs, with `fig.fig` upstream/local scope discovery.
-- Codex skill included under `skills/swatcup-auto-calibrator/`.
+SWAT and SUFI2 write fixed file names. Never run concurrent simulations in one project directory. Each worker receives a full project copy and restores only the files touched by the active parameter set.
 
-- 支持从 `model.in` 或 `par_val.txt` 单次复现。
-- 支持串行或并行采样寻优。
-- 并行采用“每个 worker 一份工程副本”，避免文件互相覆盖。
-- 可生成 SWAT-CUP 软件可直接使用的 `par_val.txt`。
-- 自动输出最佳参数 `*.best_model.in`。
-- 可根据结果 CSV 缩小下一轮 `par_inf.txt`。
-- 内置 R2、NSE、KGE、PBIAS 指标。
-- 附带 Codex skill，可让代理按规范执行率定流程。
+Keep the source project unchanged. Reproduce one known parameter set before sampling, derive station and reservoir scope from the current `fig.fig`, and replay the selected whole-model combination before delivery. Direct-only `.sol`, `.wus`, and `.res` edits should be baked into the root project, `Backup/`, and `DirectBase/` when the installed Swat_Edit cannot change them.
 
-## Requirements 环境要求
+## Requirements
 
-- Windows is recommended because most SWAT-CUP projects contain Windows executables.
 - Python 3.10 or newer.
-- A SWAT-CUP SUFI2 project folder containing:
-  - `swat.exe`
-  - `SUFI2_extract_rch.exe`
-  - `SUFI2.IN/par_inf.txt`
-  - `SUFI2.IN/par_val.txt`
-  - `SUFI2.IN/observed_rch.txt`
-  - `DirectBase/` or `Backup/` with editable SWAT input files.
-
-建议在 Windows 上运行，因为大多数 SWAT-CUP 工程包含 Windows 可执行文件。工程目录必须包含 `swat.exe`、`SUFI2_extract_rch.exe`、`SUFI2.IN` 参数和观测文件，以及 `DirectBase/` 或 `Backup/` 基准输入文件。
-
-## Install 安装
+- A Windows SWAT-CUP SUFI2 project containing `swat.exe`, `SUFI2_extract_rch.exe`, `SUFI2.IN/`, and `DirectBase/` or `Backup/`.
+- NumPy and Pillow only for 95PPU charts.
 
 ```powershell
 git clone https://github.com/justo888777/swatcup-auto-calibrator.git
 cd swatcup-auto-calibrator
 python -m pip install -e .
+
+# Include 95PPU chart dependencies
+python -m pip install -e ".[ppu]"
 ```
 
-Or run without installation:
+The package command is `swatcup-auto`. The same runner is embedded in the Codex Skill at `skills/swatcup-auto-calibrator/scripts/swatcup_auto_runner.py`.
+
+## Quick Start
+
+Audit topology and structural inputs:
 
 ```powershell
-python -m swatcup_auto --help
+python skills/swatcup-auto-calibrator/scripts/audit_structure.py `
+  --project "D:\Projects\HHB\Project.Sufi2.SwatCup" `
+  --out-dir ".\results\structure"
 ```
 
-## Quick Start 快速开始
-
-Single run from a known parameter file:
+Reproduce a known parameter set:
 
 ```powershell
 swatcup-auto single `
-  --project "D:\Projects\Dianchi\SWAT_CUP\Best_CUP.Sufi2.SwatCup" `
+  --project "D:\Projects\HHB\Project.Sufi2.SwatCup" `
   --model-in ".\best_model.in"
 ```
 
-Run 200 samples serially:
+Run 200 successful samples in four isolated workers, allowing up to 240 attempts:
 
 ```powershell
 swatcup-auto sample `
-  --project "D:\Projects\Dianchi\SWAT_CUP\Best_CUP.Sufi2.SwatCup" `
+  --project "D:\Projects\HHB\Project.Sufi2.SwatCup" `
   --runs 200 `
-  --score-mode sediment `
-  --sediment-weight 3 `
-  --out-csv ".\results\sediment_round1.csv"
-```
-
-Run 2000 samples in parallel with 4 independent worker copies:
-
-```powershell
-swatcup-auto sample `
-  --project "D:\Projects\Dianchi\SWAT_CUP\Best_CUP.Sufi2.SwatCup" `
-  --runs 2000 `
+  --max-attempts 240 `
   --workers 4 `
   --refresh-workers `
-  --score-mode sediment `
-  --out-csv ".\results\sediment_round1_parallel.csv"
-```
-
-Generate a `par_val.txt` plan for SWAT-CUP 95PPU:
-
-```powershell
-swatcup-auto plan `
-  --project "D:\Projects\Dianchi\SWAT_CUP\Best_CUP.Sufi2.SwatCup" `
-  --runs 2000 `
-  --center-model-in ".\results\sediment_round1_parallel.best_model.in" `
+  --center-model-in ".\best_model.in" `
   --scale 0.15 `
-  --out-par-val ".\results\par_val_2000.txt"
+  --score-mode multisite_timeseries `
+  --variable-weights "FLOW_OUT_17=2,FLOW_OUT_60=2" `
+  --series-dir ".\results\series" `
+  --out-csv ".\results\round1.csv"
 ```
 
-Narrow `par_inf.txt` for the next iteration:
+Optional `--min-station-nse` and `--min-station-kge` thresholds require every observation block to pass before `*.best_model.in` is exported.
+
+Build station-specific 95PPU diagnostics from complete successful runs:
 
 ```powershell
-swatcup-auto shrink `
-  --par-inf "D:\Projects\Dianchi\SWAT_CUP\Best_CUP.Sufi2.SwatCup\SUFI2.IN\par_inf.txt" `
-  --results-csv ".\results\sediment_round1_parallel.csv" `
-  --factor 0.20 `
-  --out-par-inf ".\results\par_inf_round2.txt"
+python skills/swatcup-auto-calibrator/scripts/build_95ppu.py `
+  --observed "D:\Projects\HHB\Project.Sufi2.SwatCup\SUFI2.IN\observed_rch.txt" `
+  --final-series-csv ".\results\series\run_42_series.csv" `
+  --ensemble-dir ".\results\series" `
+  --results-csv ".\results\round1.csv" `
+  --expected-samples 200 `
+  --out-dir ".\results\95ppu"
 ```
 
-Find reservoirs that can affect selected observation subbasins and generate conservative `.res` ranges:
+## Reservoir And WUS Scope
+
+Report only reservoirs local to or upstream of selected observation stations:
 
 ```powershell
 swatcup-auto reservoir-scope `
-  --project "D:\Projects\HHB\Best_CUP.Sufi2.SwatCup" `
-  --stations "2,7,14" `
-  --out-par-inf ".\results\reservoir_scope_par_inf.txt" `
-  --runs 50
+  --project "D:\Projects\HHB\Project.Sufi2.SwatCup" `
+  --stations "17,60"
 ```
 
-## Parallel Design 并行设计
+Write conservative reservoir parameter rows when a separate range file is useful:
 
-Do not run multiple SWAT simulations in the same folder. SWAT and SUFI2 write fixed file names, so shared-folder parallelism will corrupt runs.
+```powershell
+swatcup-auto reservoir-scope `
+  --project "D:\Projects\HHB\Project.Sufi2.SwatCup" `
+  --stations "17,60" `
+  --out-par-inf ".\results\reservoir_par_inf.txt" `
+  --runs 200
+```
 
-不要在同一个工程目录中同时跑多个 SWAT 进程。SWAT 和 SUFI2 会写固定文件名，共享目录并行很容易互相覆盖。
+Monthly `STARG(month)`, `OFLOWMN(month)`, `OFLOWMX(month)`, and `WURESN(month)` ranges are centered on the current month. Existing minimum/maximum outflow ordering is preserved by the generated ranges. The command does not sample reservoir operating modes such as `IRESCO` by default.
 
-This tool uses worker-copy parallelism:
+`.wus` parameters use the same syntax, for example `v__WURCH(7).wus________17`. Verify project-specific WUS units and physical records before treating withdrawals as calibration variables.
 
-- Worker 1 runs in `*_workers/worker_01`.
-- Worker 2 runs in `*_workers/worker_02`.
-- Each worker restores from its own `DirectBase/` or `Backup/`.
-- Results are merged after workers finish.
+## GUI Planning And Delivery
 
-## Parameter Names 参数命名
+Generate a GUI `par_val.txt` plan with the exact accepted center in row 1:
 
-The runner supports common SWAT-CUP SUFI2 parameter forms:
+```powershell
+swatcup-auto plan `
+  --project "D:\Projects\HHB\Project.Sufi2.SwatCup" `
+  --runs 1000 `
+  --center-model-in ".\results\round1.best_model.in" `
+  --scale 0.10 `
+  --out-par-val ".\results\par_val_1000.txt"
+```
 
-- `v__PARAM.ext...`: replace value.
-- `r__PARAM.ext...`: relative change, `old * (1 + value)`.
-- `a__PARAM.ext...`: additive change, `old + value`.
+Review and synchronize accepted direct-only files:
 
-Supported SWAT input extensions include `.bsn`, `.hru`, `.mgt`, `.sol`, `.rte`, `.sub`, `.gw`, and `.res`.
+```powershell
+python skills/swatcup-auto-calibrator/scripts/sync_baked_inputs.py `
+  --project "D:\Projects\HHB\Delivery.Sufi2.SwatCup" `
+  --model-in ".\results\round1.best_model.in" `
+  --dry-run
 
-Reservoir parameters use the same SUFI2-style syntax:
+python skills/swatcup-auto-calibrator/scripts/sync_baked_inputs.py `
+  --project "D:\Projects\HHB\Delivery.Sufi2.SwatCup" `
+  --model-in ".\results\round1.best_model.in"
+```
 
-- `v__RES_RR.res________20`: replace a scalar field in the reservoir whose `RES_SUB` or file subbasin selector is `20`.
-- `v__STARG.res________20`: replace all 12 monthly target storage values.
-- `v__WURESN(4).res________20`: replace only April consumptive reservoir withdrawal.
+Validate the formal project after its native Pre/Run/Post BAT smoke test:
 
-The `reservoir-scope` command reads `fig.fig` and only proposes `.res` rows for reservoirs that are local to or upstream of the requested observation subbasins. It intentionally does not sample `IRESCO` by default. Generated ranges are conservative and based on current reservoir settings: release rates, target storage, evaporation coefficient, bottom seepage, existing water-use months, and non-zero outflow constraints are adjusted mildly rather than opened to arbitrary data-fitting ranges.
+```powershell
+python skills/swatcup-auto-calibrator/scripts/native_gui_check.py `
+  --project "D:\Projects\HHB\Delivery.Sufi2.SwatCup" `
+  --source-project "D:\Projects\HHB\Project.Sufi2.SwatCup" `
+  --expected-formal-runs 1000 `
+  --smoke-out ".\results\smoke\SUFI2.OUT" `
+  --smoke-runs 3 `
+  --require-empty-out `
+  --strict
+```
 
 ## Codex Skill
 
-The repository includes a Codex skill:
+The repository includes the installable Skill directory:
 
 ```text
 skills/swatcup-auto-calibrator/
 ```
 
-Use it when a Codex agent needs to automate SWAT-CUP calibration, reproduce a best run, create a `par_val.txt` plan, run worker-copy parallel sampling, or summarize metrics.
+Its workflow requires source-project preservation, topology-derived calibration scope, process-aware diagnostics, whole-model replay, physical constraints for WUS/reservoir changes, and native GUI validation.
 
-## Notes 注意事项
+## License
 
-- Keep a clean `DirectBase/` copy when possible. It prevents cumulative relative-parameter drift.
-- Use `--refresh-workers` when the source project, `obs`, or parameter ranges changed.
-- The tool does not replace SWAT-CUP licensing or executables. It only automates a local project you already have.
-- For publication workflows, keep calibration and validation periods explicit in separate observed files or result folders.
-
-- 建议保留干净的 `DirectBase/`，避免相对参数被重复叠加。
-- 工程、观测文件或参数范围变化后，并行采样请加 `--refresh-workers`。
-- 本工具不包含也不替代 SWAT-CUP 授权和可执行文件，只自动化你本地已有工程。
-- 写论文时建议把率定期和验证期观测文件、结果目录明确分开。
+MIT. SWAT and SWAT-CUP executables and licenses are not included.

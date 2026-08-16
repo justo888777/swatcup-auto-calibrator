@@ -1,69 +1,89 @@
 ---
 name: swatcup-auto-calibrator
-description: Use when automating SWAT-CUP SUFI2 calibration without the GUI, reproducing a best run from model.in, generating par_val.txt sampling plans, running serial or worker-copy parallel SWAT simulations, narrowing par_inf.txt, reporting R2 NSE KGE PBIAS metrics, or performing conservative reservoir .res co-calibration by reading fig.fig upstream/local relationships.
+description: Automate and diagnose SWAT-CUP SUFI2 multi-site calibration, including direct small-sample searches, process-line and 95PPU evaluation, fig.fig-based WUS/reservoir co-calibration with physical constraints, parameter-range narrowing, and native GUI-ready project validation. Use for SWAT or SWAT-CUP flow calibration, model.in replay, par_inf/par_val generation, independent-branch or upstream/downstream station tuning, and delivery of a BAT-runnable GUI project.
 ---
 
 # SWAT-CUP Auto Calibrator
 
-## Overview
+Use this skill to improve a SWAT-CUP project without sacrificing hydrograph timing or native GUI compatibility. Treat the project as a file protocol: inspect structure, reproduce one known run, diagnose each station, sample in isolated copies, replay the selected whole-model combination, then validate the formal GUI package.
 
-This skill helps Codex automate SWAT-CUP/SUFI2 calibration by treating the project folder as a file protocol instead of driving the GUI. Use the included Python runner for parameter editing, SWAT execution, SUFI2 output extraction, metric calculation, sampling, next-round range narrowing, and conservative reservoir `.res` co-calibration.
+## Non-negotiable rules
+
+- Preserve the user's source project. Run experiments in a full copy.
+- Never run two SWAT simulations in one project directory. Give every worker a separate full copy.
+- Prefer `DirectBase/` as the direct-edit baseline, falling back to `Backup/` only when necessary.
+- Reproduce one known `model.in` before sampling. If the replay differs, stop and resolve the baseline or executable mismatch.
+- Evaluate the hydrograph as well as KGE/NSE. A higher scalar score does not justify wrong peak timing, flattened floods, false zero flow, or damaged baseflow.
+- Derive station dependencies from the current project's `fig.fig`; never carry station IDs, branch groupings, or upstream/downstream chains from another basin. Tune the blocks discovered for this project and replay changes through every affected downstream block.
+- Do not merge incompatible per-station optima. A parameter mosaic is accepted only after a single whole-model replay.
+- Preserve known-correct point sources, withdrawals, reservoir releases, and record inputs. Structural inputs are not arbitrary calibration knobs.
+- Keep direct-only edits such as selected `.sol`, `.wus`, and `.res` changes out of GUI `par_inf.txt` unless the installed Swat_Edit version is proven to support them. Bake accepted values into root, `Backup/`, and `DirectBase/`.
+- Run the original project BAT files for final GUI validation. Keep `Echo/`, Windows CRLF control files, and an empty formal `SUFI2.OUT/`.
 
 ## Workflow
 
-1. Inspect the project structure before running anything:
-   - Confirm `swat.exe`, `SUFI2_extract_rch.exe`, `SUFI2.IN/par_inf.txt`, `SUFI2.IN/par_val.txt`, and `SUFI2.IN/observed_rch.txt`.
-   - Confirm `DirectBase/` exists. If not, use `Backup/` as the baseline.
-   - Read `Absolute_SWAT_Values.txt` when parameter meanings or physical ranges are unclear.
-2. For a known parameter set, run `single` with `--model-in`.
-3. For optimization, run `sample` first with a small number of runs.
-4. Use `--workers N` only when there is enough disk space for N full project copies.
-5. For SWAT-CUP GUI 95PPU, use `plan` to generate `par_val.txt` and copy it into `SUFI2.IN/par_val.txt`.
-6. Use `shrink` after a sample CSV to build a narrower `par_inf.txt` for the next iteration.
-7. For reservoir-affected stations, run `reservoir-scope` first. It reads `fig.fig`, lists local/upstream reservoirs, and can generate conservative `.res` parameter rows for no-GUI sampling.
-8. Report station-level R2, NSE, KGE, and PBIAS. For sediment work, keep sediment metrics separate from the combined score.
+1. Inspect `SUFI2.IN`, `fig.fig`, executables, BAT files, `Backup/`, `DirectBase/`, `Echo/`, observed block lengths, and current outputs.
+2. Run `audit_structure.py`. Verify gauge routing, dependency blocks, WUS magnitude/units, upstream reservoirs, downstream-of-gauge facilities, and `recmon`/`recday`/`reccnst` inputs.
+3. Replay the current best model once with `single`. Save station metrics and process lines.
+4. Run a small canary sized for the current run cost and parameter dimension. Use its success rate to set the attempt limit, then run exactly the successful-sample target requested for this task with `--series-dir` enabled. If the user supplied no target, choose and state one for this project; do not reuse a count from a prior basin.
+5. Rank candidates hierarchically: valid process first; current task thresholds and variable weights second; the configured aggregate objective third; timing, log-NSE, bias, peaks, low flow, and zero-flow behavior next. Use `multisite_timeseries` for process-aware search guidance, but still inspect the CSV and charts.
+6. Build 95PPU diagnostics from the raw saved ensemble. Low P-factor with observed peaks outside a reasonably wide band suggests missing/incorrect structure or inputs, not merely a range that should be narrowed.
+7. Narrow only parameters with demonstrated signal and plausible process effects. Keep wider ranges for weakly identified stations; fix structural data before squeezing parameters around a false optimum.
+8. Replay the selected whole-model parameter set once, update the clean direct baseline, and generate the next GUI `par_val.txt`.
+9. Bake accepted direct-only inputs with `sync_baked_inputs.py`. Validate the formal package with `native_gui_check.py`, then run a multi-row native Pre/Run/Post BAT smoke test using the task's configured smoke count.
 
-## Safety Rules
+## Primary commands
 
-- Never run parallel simulations in the same SWAT-CUP project directory.
-- In parallel mode, each worker must own a separate copied project folder.
-- Do not modify the original project while worker copies are running.
-- Use `--refresh-workers` after changing the source project, observed file, `par_inf.txt`, `par_val.txt`, or executable set.
-- Prefer `DirectBase/` over `Backup/` because it represents the clean non-cumulative baseline for direct editing.
-- Keep calibration and validation observed files in clearly named files or folders.
-- Do not put `.res` parameters into a SWAT-CUP GUI run unless the GUI version is known to apply them. For GUI runs, write fixed reservoir files into both the project root and `Backup/`, then keep GUI `par_inf.txt` to supported non-RES parameters.
-- Keep reservoir changes physically mild. Do not sample `IRESCO` unless the user provides an operational reason; prefer conservative ranges around current `RES_RR`, `NDTARGR`, `STARG`, `EVRSV`, `RES_K`, existing `WURESN` months, and non-zero `OFLOWMN/OFLOWMX`.
-
-## Commands
-
-Run from the repository root or install the package and use `swatcup-auto`.
+Run from this skill directory. Define the PowerShell variables from the current project and request before using these templates; none of the counts, thresholds, topology, or paths are skill defaults.
 
 ```powershell
-python -m swatcup_auto single --project "D:\path\Best_CUP.Sufi2.SwatCup" --model-in ".\best_model.in"
+python scripts/audit_structure.py --project $project --out-dir $auditDir
 ```
 
 ```powershell
-python -m swatcup_auto sample --project "D:\path\Best_CUP.Sufi2.SwatCup" --runs 200 --score-mode sediment --out-csv ".\results\round1.csv"
+python scripts/swatcup_auto_runner.py single --project $project --model-in $bestModel
 ```
 
 ```powershell
-python -m swatcup_auto sample --project "D:\path\Best_CUP.Sufi2.SwatCup" --runs 2000 --workers 4 --refresh-workers --score-mode sediment --out-csv ".\results\round1_parallel.csv"
+python scripts/swatcup_auto_runner.py reservoir-scope --project $project --stations $stationIds
+```
+
+Only add the reported local/upstream reservoirs to joint sampling. When writing a reservoir-only range file, add `--out-par-inf $reservoirParInf --runs $successfulRuns`; monthly `STARG`, `OFLOWMN`, `OFLOWMX`, and `WURESN` rows retain the current seasonal pattern and use bounded ranges.
+
+```powershell
+python scripts/swatcup_auto_runner.py sample --project $project --runs $successfulRuns --max-attempts $attemptLimit --workers $workerCount --refresh-workers --scale $sampleScale --score-mode multisite_timeseries --min-station-nse $nseFloor --series-dir $seriesDir --out-csv $resultsCsv
+```
+
+When the current task defines non-equal observation-block weights, add `--variable-weights $variableWeights` using `NAME=WEIGHT` pairs. Omit it for an explicitly chosen equal-weight objective.
+
+```powershell
+python scripts/build_95ppu.py --observed $observedRch --final-series-csv $bestSeries --ensemble-dir $seriesDir --results-csv $resultsCsv --expected-samples $successfulRuns --out-dir $ppuDir
+```
+
+`build_95ppu.py` requires NumPy and Pillow. Install the repository with `python -m pip install -e ".[ppu]"` when they are not already available.
+
+```powershell
+python scripts/swatcup_auto_runner.py shrink --par-inf $parInf --results-csv $resultsCsv --factor $shrinkFactor --out-par-inf $nextParInf
 ```
 
 ```powershell
-python -m swatcup_auto plan --project "D:\path\Best_CUP.Sufi2.SwatCup" --runs 2000 --center-model-in ".\best_model.in" --scale 0.15 --out-par-val ".\par_val_2000.txt"
+python scripts/swatcup_auto_runner.py plan --project $project --runs $formalRuns --center-model-in $bestModel --scale $planScale --out-par-val $formalParVal
 ```
 
 ```powershell
-python -m swatcup_auto shrink --par-inf ".\SUFI2.IN\par_inf.txt" --results-csv ".\results\round1.csv" --factor 0.20 --out-par-inf ".\par_inf_round2.txt"
+python scripts/sync_baked_inputs.py --project $deliveryProject --model-in $bestModel --dry-run
+python scripts/sync_baked_inputs.py --project $deliveryProject --model-in $bestModel
 ```
 
+Review the dry-run scope before synchronizing accepted direct-only `.sol`, `.wus`, and `.res` inputs into `Backup/` and `DirectBase/`.
+
 ```powershell
-python -m swatcup_auto reservoir-scope --project "D:\path\Best_CUP.Sufi2.SwatCup" --stations "2,7,14" --out-par-inf ".\reservoir_par_inf.txt" --runs 50
+python scripts/native_gui_check.py --project $deliveryProject --source-project $sourceProject --expected-formal-runs $formalRuns --smoke-out $smokeOut --smoke-runs $smokeRuns --best-series-csv $bestSeries --require-empty-out --strict --json-out $nativeCheckJson
 ```
 
 ## References
 
-- `references/workflow.md`: bilingual user workflow and publishing notes.
-- `references/parallel.md`: worker-copy parallel design and failure modes.
-- `scripts/swatcup_auto_runner.py`: self-contained runner copy for skill-only installs.
+- `references/workflow.md`: end-to-end calibration, selection, and stopping logic.
+- `references/multisite-timeseries.md`: dependency blocks, process diagnostics, 95PPU, and structural causes.
+- `references/native-gui-delivery.md`: baked inputs and native BAT delivery requirements.
+- `references/parallel.md`: worker-copy sampling, cold starts, retries, and resource sizing.

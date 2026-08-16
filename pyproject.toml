@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "swatcup-auto-calibrator"
-version = "1.0.1"
-description = "GUI-free SWAT-CUP SUFI2 calibration runner with safe worker-copy parallel sampling and conservative reservoir co-calibration."
+version = "1.1.0"
+description = "Process-aware SWAT-CUP SUFI2 calibration with isolated sampling, topology audits, and conservative WUS/reservoir co-calibration."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -24,6 +24,9 @@ classifiers = [
 
 [project.scripts]
 swatcup-auto = "swatcup_auto.runner:main"
+
+[project.optional-dependencies]
+ppu = ["numpy>=1.24", "Pillow>=10"]
 
 [tool.setuptools.packages.find]
 where = ["."]

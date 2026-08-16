@@ -1,30 +1,24 @@
-# Parallel Sampling / 并行采样
+# Parallel sampling
 
-## Core Rule
+## Isolation rule
 
-Never run multiple SWAT simulations in the same project folder. SWAT and SUFI2 write fixed output names such as `output.rch`, `SUFI2.OUT/*.txt`, logs, and temporary files. Shared-folder parallelism can silently mix outputs and produce false metrics.
+SWAT and SUFI2 write fixed names such as `output.rch`, extracted `FLOW_OUT_*.txt`, and logs. Shared-folder parallelism can silently combine files from different simulations. Every worker therefore owns a full project copy and its own current working directory.
 
-## Worker-Copy Pattern
+## Safe worker lifecycle
 
-The safe pattern is:
+1. Benchmark one complete simulation, including extraction and first-start overhead.
+2. Choose a worker count from measured single-run cost, disk throughput, memory, CPU, and executable behavior. Record the chosen value for the current project; do not carry it across projects without remeasuring.
+3. Refresh workers after changes to observations, executables, `fig.fig`, `DirectBase/`, `Backup/`, control files, or structural inputs.
+4. Restore only files touched by the active parameters before each run. Full-folder restores create unnecessary disk contention.
+5. Give each run a deterministic ID and seed. Save worker-local partial CSVs immediately after each result.
+6. Merge only completed rows and retain failures with their messages. Rerun missing IDs in fresh worker copies.
 
-1. Copy the full SWAT-CUP project to `worker_01`, `worker_02`, and so on.
-2. Each worker restores its own editable files from `DirectBase/` or `Backup/`.
-3. Each worker edits only its own `model.in` equivalent and SWAT input files.
-4. Each worker runs `swat.exe` and `SUFI2_extract_rch.exe` in its own current working directory.
-5. The controller merges rows after all workers finish.
+## Cold starts and slow first simulations
 
-## When To Refresh Workers
+Reservoir record modes and native executables can make the first run much slower than later runs. Use a realistic timeout and watch for output progress. Do not kill a first run solely because it exceeds the warm-run time. Distinguish a slow cold start from a hung process by checking file updates and process activity.
 
-Use `--refresh-workers` when any of these changed:
+`Swat_Edit.exe` may require an interactive console. Redirecting its standard streams can cause .NET or prompt failures. Use a terminal/PTY for the native Pre step and wait for its prompt before continuing.
 
-- `observed_rch.txt`
-- `par_inf.txt`
-- `par_val.txt`
-- `DirectBase/` or `Backup/`
-- `swat.exe` or extraction executables
-- Any SWAT input files
+## Restart strategy
 
-## 中文要点
-
-不要多个进程共享同一个 SWAT-CUP 工程目录。安全并行必须为每个 worker 复制一份完整工程。工程、观测、参数范围或基准输入文件变化后，要加 `--refresh-workers`，否则 worker 可能继续使用旧文件。
+Keep `direct_partial_results.csv` in every worker and the saved time series in a shared result directory using unique run IDs. Failed attempts carry `status` and `error`; replacement IDs continue until the requested successful count or `--max-attempts`. Never trust a summary CSV if the corresponding complete process series or output-length checks are missing.

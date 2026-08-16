@@ -15,13 +15,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-EDIT_EXTENSIONS = {"bsn", "hru", "mgt", "sol", "rte", "sub", "gw", "res"}
+EDIT_EXTENSIONS = {"bsn", "hru", "mgt", "sol", "rte", "sub", "gw", "res", "wus"}
 SOL_LABELS = {
     "SOL_AWC": "Ave. AW Incl. Rock Frag",
     "SOL_K": "Ksat. (est.)",
     "USLE_K": "Erosion K",
 }
 RES_ARRAY_LABELS = {"OFLOWMX", "OFLOWMN", "STARG", "WURESN"}
+WUS_ARRAY_LABELS = {"WUPND", "WURCH", "WUSHAL", "WUDEEP"}
 FIG_COMMANDS = {
     "subbasin",
     "route",
@@ -35,7 +36,7 @@ FIG_COMMANDS = {
     "finish",
 }
 FIG_FILE_PATTERN = re.compile(
-    r"\d{9}\.(?:sub|rte|swq|res|lwq|pnd|wus|dat)",
+    r"(?:\d{9}\.(?:sub|rte|swq|res|lwq|pnd|wus)|[A-Za-z0-9_.-]+\.dat)",
     re.IGNORECASE,
 )
 
@@ -122,8 +123,8 @@ def parse_par_inf(path: Path) -> list[tuple[str, float, float]]:
         parts = line.split()
         if len(parts) >= 3 and "__" in parts[0]:
             rows.append((parts[0], float(parts[1]), float(parts[2])))
-            if expected is not None and len(rows) >= expected:
-                break
+    if expected is not None and len(rows) != expected:
+        raise ValueError(f"{path}: declares {expected} parameters but contains {len(rows)} rows")
     return rows
 
 
@@ -281,6 +282,8 @@ def apply_operation(old_value: float, param: Parameter) -> float:
         new_value = min(1000.0, max(0.0, new_value))
     elif param.name == "WURESN":
         new_value = min(5000.0, max(0.0, new_value))
+    elif param.name in WUS_ARRAY_LABELS:
+        new_value = min(10000.0, max(0.0, new_value))
     elif param.name == "LAT_SED":
         new_value = max(0.0, new_value)
     elif param.name in {"CH_L1", "CH_L2"}:
@@ -319,6 +322,18 @@ def format_pipe_line(new_value: float, rest: str) -> str:
     return f"{new_value:16.6f}    |{rest}"
 
 
+INTEGER_PIPE_PARAMETERS = {
+    "CH_EQN",
+    "SUBD_CHSED",
+    "ICFAC",
+    "ICN",
+    "IRESCO",
+    "IFLOD1R",
+    "IFLOD2R",
+    "NDTARGR",
+}
+
+
 def numeric_before_pipe(line: str) -> float:
     before = line.split("|", 1)[0]
     match = re.search(r"[-+]?\d+(?:\.\d+)?(?:[Ee][-+]?\d+)?", before)
@@ -341,7 +356,10 @@ def edit_pipe_parameter(path: Path, backup_path: Path, param: Parameter) -> int:
             _, after = body.split("|", 1)
             old_value = numeric_before_pipe(body)
             new_value = apply_operation(old_value, param)
-            body = format_pipe_line(new_value, after)
+            if param.name in INTEGER_PIPE_PARAMETERS:
+                body = f"{int(round(new_value)):16d}    |{after}"
+            else:
+                body = format_pipe_line(new_value, after)
             count += 1
         new_lines.append(body + newline)
 
@@ -393,7 +411,7 @@ def res_values(line: str) -> list[float]:
 
 
 def format_res_array_line(values: list[float]) -> str:
-    return "".join(f"{value:10.1f}" for value in values)
+    return "".join(f"{value:10.4f}" for value in values)
 
 
 def edit_res_array_parameter(path: Path, backup_path: Path, param: Parameter) -> int:
@@ -433,6 +451,29 @@ def edit_res_parameter(path: Path, backup_path: Path, param: Parameter) -> int:
     if param.name in RES_ARRAY_LABELS:
         return edit_res_array_parameter(path, backup_path, param)
     return edit_pipe_parameter(path, backup_path, param)
+
+
+def edit_wus_parameter(path: Path, backup_path: Path, param: Parameter) -> int:
+    if param.name not in WUS_ARRAY_LABELS:
+        raise ValueError(f"Unsupported .wus parameter: {param.name}")
+    lines = path.read_text(errors="strict").splitlines()
+    if len(lines) < 11:
+        raise ValueError(f"Unexpected .wus layout in {path}")
+    values: list[float] = []
+    for line in lines[3:11]:
+        values.extend(float(value) for value in line.split())
+    if len(values) != 48:
+        raise ValueError(f"Expected 48 values in {path}, got {len(values)}")
+    start = {"WUPND": 0, "WURCH": 12, "WUSHAL": 24, "WUDEEP": 36}[param.name]
+    count = 0
+    for month in range(1, 13):
+        if param.layer_index is None or param.layer_index == month:
+            index = start + month - 1
+            values[index] = apply_operation(values[index], param)
+            count += 1
+    data_lines = ["".join(f"{value:10.1f}" for value in values[index:index + 6]) for index in range(0, 48, 6)]
+    path.write_text("\n".join(lines[:3] + data_lines + lines[11:]) + "\n", encoding="utf-8")
+    return count
 
 
 def is_fig_command(line: str) -> bool:
@@ -476,8 +517,10 @@ def parse_fig(path: Path) -> dict[int, FigNode]:
             node = FigNode(op, ints[1], None, (ints[2], ints[3]), files)
         elif op in {"recmon", "recday", "reccnst"} and len(ints) >= 2:
             node = FigNode(op, ints[1], ints[2] if len(ints) >= 3 else None, (), files)
-        elif op == "saveconc" and len(ints) >= 2:
-            node = FigNode(op, ints[1], ints[2] if len(ints) >= 3 else None, (), files)
+        elif op in {"transfer", "saveconc", "finish"}:
+            # These are commands, not hydrograph-routing nodes. Transfers are
+            # parsed separately by audit_structure.py as source/destination couplings.
+            node = None
 
         if node is not None:
             nodes[node.node_id] = node
@@ -551,8 +594,8 @@ def reservoir_scope(project: Path, station_ids: list[int], fig_path: Path | None
             selector_value = selector_value or local_sub or reservoir_file_subbasin(res_file)
             if selector_value is None:
                 continue
-            relation = "local" if local_sub == station_id else "upstream" if node.node_id in upstream_ids else ""
-            if relation:
+            if node.node_id in upstream_ids:
+                relation = "local" if local_sub == station_id else "upstream"
                 scopes.append(
                     ReservoirScope(
                         station_id=station_id,
@@ -600,7 +643,8 @@ def conservative_res_parameter_rows(project: Path, scopes: list[ReservoirScope])
         selector = scope.selector
         res_rr = read_res_scalar(res_path, "RES_RR")
         if res_rr is not None and res_rr > 0:
-            rows.append((f"v__RES_RR.res________{selector}", max(0.0, res_rr * 0.75), res_rr * 1.25))
+            center = min(res_rr, 500.0)
+            rows.append((f"v__RES_RR.res________{selector}", max(0.0, center * 0.75), min(500.0, center * 1.25)))
 
         ndtargr = read_res_scalar(res_path, "NDTARGR")
         if ndtargr is not None and ndtargr > 0:
@@ -617,18 +661,19 @@ def conservative_res_parameter_rows(project: Path, scopes: list[ReservoirScope])
             else:
                 rows.append((f"v__RES_K.res________{selector}", max(0.0, res_k * 0.50), min(1.0, res_k * 2.0)))
 
-        starg = [value for value in read_res_array(res_path, "STARG") if value > 0]
-        if starg:
-            center = sum(starg) / len(starg)
-            pvol = read_res_scalar(res_path, "RES_PVOL") or center
-            evol = read_res_scalar(res_path, "RES_EVOL") or max(center, pvol)
-            rows.append(
-                (
-                    f"v__STARG.res________{selector}",
-                    max(0.0, max(center * 0.90, pvol * 0.60)),
-                    min(evol, max(center * 1.10, pvol * 0.80)),
-                )
-            )
+        starg = read_res_array(res_path, "STARG")
+        pvol = read_res_scalar(res_path, "RES_PVOL") or 0.0
+        evol = read_res_scalar(res_path, "RES_EVOL") or 0.0
+        for month, value in enumerate(starg, start=1):
+            if value <= 0:
+                continue
+            lower = max(0.0, value * 0.90)
+            upper = value * 1.10
+            if 0 < pvol * 0.60 <= value:
+                lower = max(lower, pvol * 0.60)
+            if evol >= value:
+                upper = min(upper, evol)
+            rows.append((f"v__STARG({month}).res________{selector}", lower, upper))
 
         wuresn = read_res_array(res_path, "WURESN")
         nonzero_wuresn = [(index + 1, value) for index, value in enumerate(wuresn) if value > 0]
@@ -639,12 +684,33 @@ def conservative_res_parameter_rows(project: Path, scopes: list[ReservoirScope])
             if wurtnf is not None:
                 rows.append((f"v__WURTNF.res________{selector}", max(0.0, wurtnf - 0.20), min(1.0, wurtnf + 0.20)))
 
-        for label in ("OFLOWMN", "OFLOWMX"):
-            values = read_res_array(res_path, label)
-            nonzero = [value for value in values if value > 0]
-            if nonzero:
-                center = sum(nonzero) / len(nonzero)
-                rows.append((f"v__{label}.res________{selector}", max(0.0, center * 0.50), center * 1.50))
+        oflow_min = read_res_array(res_path, "OFLOWMN")
+        oflow_max = read_res_array(res_path, "OFLOWMX")
+        for month, (minimum, maximum) in enumerate(zip(oflow_min, oflow_max), start=1):
+            if minimum > 0 and maximum > 0 and minimum <= maximum:
+                midpoint = (minimum + maximum) / 2.0
+                rows.append(
+                    (
+                        f"v__OFLOWMN({month}).res________{selector}",
+                        minimum * 0.75,
+                        min(minimum * 1.25, midpoint),
+                    )
+                )
+                rows.append(
+                    (
+                        f"v__OFLOWMX({month}).res________{selector}",
+                        max(maximum * 0.75, midpoint),
+                        maximum * 1.25,
+                    )
+                )
+            elif minimum > 0 and maximum == 0:
+                rows.append(
+                    (f"v__OFLOWMN({month}).res________{selector}", minimum * 0.75, minimum * 1.25)
+                )
+            elif maximum > 0 and minimum == 0:
+                rows.append(
+                    (f"v__OFLOWMX({month}).res________{selector}", maximum * 0.75, maximum * 1.25)
+                )
     return rows
 
 
@@ -669,9 +735,10 @@ def apply_parameters(project: Path, params: list[Parameter]) -> dict[str, int]:
                 raise FileNotFoundError(backup_path)
             restore_paths[path] = backup_path
 
-    for backup_path in backup.iterdir():
-        if backup_path.is_file() and backup_path.suffix.lower().lstrip(".") in EDIT_EXTENSIONS:
-            shutil.copyfile(backup_path, project / backup_path.name)
+    # Restore only the files touched by the active parameter set. Restoring
+    # every editable file causes severe disk contention with several workers.
+    for path, backup_path in restore_paths.items():
+        shutil.copyfile(backup_path, path)
 
     for param, files in files_by_param:
         edited = 0
@@ -681,6 +748,8 @@ def apply_parameters(project: Path, params: list[Parameter]) -> dict[str, int]:
                 edited += edit_sol_parameter(path, backup_path, param)
             elif param.extension == "res":
                 edited += edit_res_parameter(path, backup_path, param)
+            elif param.extension == "wus":
+                edited += edit_wus_parameter(path, backup_path, param)
             else:
                 edited += edit_pipe_parameter(path, backup_path, param)
         counts[param.raw_name] = edited
@@ -711,6 +780,7 @@ def run_program(project: Path, exe: str, log_name: str) -> None:
             stderr=subprocess.STDOUT,
             text=True,
             errors="ignore",
+            timeout=1800,
         )
     if result.returncode != 0:
         raise RuntimeError(f"{exe} failed with exit code {result.returncode}; see {project / log_name}")
@@ -762,7 +832,36 @@ def read_observed_blocks(path: Path) -> dict[str, list[tuple[int, float]]]:
     return blocks
 
 
-def metrics(obs: list[float], sim: list[float]) -> dict[str, float]:
+PROCESS_METRIC_KEYS = (
+    "r2", "nse", "kge", "pbias", "r", "log_nse", "clim_r",
+    "best_lag_months", "best_lag_r", "peak_offset_months",
+    "peak_capture", "lowflow_ratio", "sim_zero_fraction",
+)
+
+
+def _corr(obs: list[float], sim: list[float]) -> float:
+    if len(obs) < 3 or len(obs) != len(sim):
+        return float("nan")
+    mean_o = sum(obs) / len(obs)
+    mean_s = sum(sim) / len(sim)
+    ss_obs = sum((x - mean_o) ** 2 for x in obs)
+    ss_sim = sum((x - mean_s) ** 2 for x in sim)
+    cov = sum((o - mean_o) * (s - mean_s) for o, s in zip(obs, sim))
+    return cov / math.sqrt(ss_obs * ss_sim) if ss_obs > 0 and ss_sim > 0 else float("nan")
+
+
+def _nse(obs: list[float], sim: list[float]) -> float:
+    mean_o = sum(obs) / len(obs)
+    den = sum((x - mean_o) ** 2 for x in obs)
+    return 1.0 - sum((o - s) ** 2 for o, s in zip(obs, sim)) / den if den > 0 else float("nan")
+
+
+def metrics(
+    obs: list[float],
+    sim: list[float],
+    years: list[int] | None = None,
+    months: list[int] | None = None,
+) -> dict[str, float]:
     n = len(obs)
     if n == 0 or n != len(sim):
         raise ValueError(f"Series length mismatch: obs={len(obs)} sim={len(sim)}")
@@ -778,7 +877,72 @@ def metrics(obs: list[float], sim: list[float]) -> dict[str, float]:
     beta = mean_s / mean_o if mean_o != 0 else float("nan")
     kge = 1.0 - math.sqrt((r - 1.0) ** 2 + (alpha - 1.0) ** 2 + (beta - 1.0) ** 2)
     pbias = 100.0 * sum(s - o for o, s in zip(obs, sim)) / sum(obs) if sum(obs) != 0 else float("nan")
-    return {"r2": r * r, "nse": nse, "kge": kge, "pbias": pbias}
+    log_nse = _nse([math.log1p(max(0.0, x)) for x in obs], [math.log1p(max(0.0, x)) for x in sim])
+    months = months or [i % 12 + 1 for i in range(n)]
+    years = years or [i // 12 for i in range(n)]
+    if len(months) != n or len(years) != n:
+        raise ValueError(f"Date length mismatch: values={n} months={len(months)} years={len(years)}")
+    climatology_months = [month for month in range(1, 13) if month in months]
+    obs_clim = [
+        sum(o for o, m in zip(obs, months) if m == month) / sum(1 for m in months if m == month)
+        for month in climatology_months
+    ]
+    sim_clim = [
+        sum(s for s, m in zip(sim, months) if m == month) / sum(1 for m in months if m == month)
+        for month in climatology_months
+    ]
+
+    best_lag = 0
+    best_lag_r = -2.0
+    for lag in range(-3, 4):
+        if lag > 0:
+            lag_r = _corr(obs[:-lag], sim[lag:])
+        elif lag < 0:
+            lag_r = _corr(obs[-lag:], sim[:lag])
+        else:
+            lag_r = r
+        if math.isfinite(lag_r) and (
+            lag_r > best_lag_r + 1e-12
+            or (abs(lag_r - best_lag_r) <= 1e-12 and abs(lag) < abs(best_lag))
+        ):
+            best_lag, best_lag_r = lag, lag_r
+
+    offsets: list[int] = []
+    for year in sorted(set(years)):
+        indices = [i for i, y in enumerate(years) if y == year]
+        if not indices:
+            continue
+        oi = max(indices, key=lambda i: obs[i])
+        si = max(indices, key=lambda i: sim[i])
+        raw = abs(months[oi] - months[si])
+        offsets.append(min(raw, 12 - raw))
+    offsets.sort()
+    peak_offset = float(offsets[len(offsets) // 2]) if offsets else float("nan")
+
+    top_n = max(1, math.ceil(n * 0.10))
+    ordered = sorted(range(n), key=lambda i: obs[i])
+    high_indices = ordered[-top_n:]
+    low_indices = ordered[:top_n]
+    high_obs = sum(obs[i] for i in high_indices)
+    peak_capture = sum(sim[i] for i in high_indices) / high_obs if high_obs else float("nan")
+    low_obs = sum(obs[i] for i in low_indices) / top_n
+    lowflow_ratio = (sum(sim[i] for i in low_indices) / top_n) / low_obs if low_obs else float("nan")
+
+    return {
+        "r2": r * r,
+        "nse": nse,
+        "kge": kge,
+        "pbias": pbias,
+        "r": r,
+        "log_nse": log_nse,
+        "clim_r": _corr(obs_clim, sim_clim),
+        "best_lag_months": float(best_lag),
+        "best_lag_r": best_lag_r,
+        "peak_offset_months": peak_offset,
+        "peak_capture": peak_capture,
+        "lowflow_ratio": lowflow_ratio,
+        "sim_zero_fraction": sum(1 for x in sim if x <= 1e-10) / n,
+    }
 
 
 def evaluate_outputs(project: Path, observed_path: Path | None = None) -> dict[str, dict[str, float]]:
@@ -790,46 +954,78 @@ def evaluate_outputs(project: Path, observed_path: Path | None = None) -> dict[s
         sim_values = sim_all
         if len(obs_values) != len(sim_values):
             raise ValueError(f"{name}: series length mismatch obs={len(obs_values)} sim={len(sim_values)}")
-        result[name] = metrics(obs_values, sim_values)
+        years: list[int] = []
+        months: list[int] = []
+        for index, _obs_value in pairs:
+            zero_index = index - 1
+            years.append(zero_index // 12)
+            months.append(zero_index % 12 + 1)
+        result[name] = metrics(obs_values, sim_values, years=years, months=months)
     return result
 
 
-def combined_score(result: dict[str, dict[str, float]], sediment_weight: float = 3.0) -> float:
-    weights = {name: 1.0 for name in result}
-    if "SED_CONC_7" in weights:
-        weights["SED_CONC_7"] = sediment_weight
-    total_w = sum(weights.values())
-    return sum(result[name]["kge"] * weights[name] for name in result) / total_w
+def parse_variable_weights(value: str | None, variable_names: list[str]) -> dict[str, float]:
+    weights = {name: 1.0 for name in variable_names}
+    if not value:
+        return weights
+    for item in value.split(","):
+        name, separator, raw_weight = item.strip().partition("=")
+        if not separator or name not in weights:
+            raise ValueError(f"Invalid --variable-weights item: {item!r}")
+        weight = float(raw_weight)
+        if not math.isfinite(weight) or weight <= 0.0:
+            raise ValueError(f"Weight for {name} must be finite and positive")
+        weights[name] = weight
+    return weights
 
 
-def sediment_shape_score(result: dict[str, dict[str, float]]) -> float:
-    sed = result["SED_CONC_7"]
-    flow_kge = [row["kge"] for name, row in result.items() if name != "SED_CONC_7"]
-    flow_penalty = sum(max(0.0, 0.65 - value) for value in flow_kge)
-    bias_penalty = abs(sed["pbias"]) / 100.0
-    return sed["r2"] + sed["nse"] + 0.2 * sed["kge"] - 0.5 * bias_penalty - flow_penalty
+def combined_score(
+    result: dict[str, dict[str, float]],
+    variable_weights: dict[str, float] | None = None,
+) -> float:
+    """Return the configured weighted mean KGE across current observation blocks."""
+    weights = variable_weights or {name: 1.0 for name in result}
+    total_weight = sum(weights[name] for name in result)
+    return sum(result[name]["kge"] * weights[name] for name in result) / total_weight
 
 
-def hhb_flow_score(result: dict[str, dict[str, float]]) -> float:
-    rows = list(result.values())
-    mean_kge = sum(row["kge"] for row in rows) / len(rows)
-    bounded_nse = [max(-2.0, min(1.0, row["nse"])) for row in rows]
-    mean_nse = sum(bounded_nse) / len(bounded_nse)
-    negative_nse_penalty = sum(max(0.0, -row["nse"]) for row in rows) / len(rows)
-    negative_kge_penalty = sum(max(0.0, -row["kge"]) for row in rows) / len(rows)
-    bias_penalty = sum(min(abs(row["pbias"]) / 100.0, 2.0) for row in rows) / len(rows)
-    focus = result.get("FLOW_OUT_2")
-    focus_penalty = 0.0
-    if focus:
-        focus_penalty = 0.20 * max(0.0, -focus["kge"]) + 0.10 * max(0.0, -focus["nse"])
-    return (
-        0.70 * mean_kge
-        + 0.30 * mean_nse
-        - 0.35 * negative_nse_penalty
-        - 0.20 * negative_kge_penalty
-        - 0.08 * bias_penalty
-        - focus_penalty
-    )
+def multisite_timeseries_score(
+    result: dict[str, dict[str, float]],
+    variable_weights: dict[str, float] | None = None,
+) -> float:
+    """Weighted multi-variable score rewarding shape, timing, balance, and positive NSE."""
+    weights = variable_weights or {name: 1.0 for name in result}
+    station_scores: list[tuple[float, float]] = []
+    negative_nse_penalty = 0.0
+    total_weight = 0.0
+    for name, row in result.items():
+        weight = weights[name]
+        kge_value = max(-1.5, min(1.0, row["kge"]))
+        nse_value = max(-1.5, min(1.0, row["nse"]))
+        r_value = max(-1.0, min(1.0, row["r"]))
+        log_nse_value = max(-1.5, min(1.0, row["log_nse"]))
+        clim_value = max(-1.0, min(1.0, row["clim_r"]))
+        timing_penalty = min(abs(row["best_lag_months"]), 3.0) / 3.0
+        peak_offset_penalty = min(row["peak_offset_months"], 6.0) / 6.0
+        capture = max(0.05, min(20.0, row["peak_capture"]))
+        capture_penalty = min(abs(math.log(capture)), 2.0) / 2.0
+        zero_penalty = min(row["sim_zero_fraction"], 0.60) / 0.60
+        station_scores.append((weight,
+            0.35 * kge_value
+            + 0.23 * nse_value
+            + 0.12 * r_value
+            + 0.12 * log_nse_value
+            + 0.10 * clim_value
+            - 0.025 * timing_penalty
+            - 0.025 * peak_offset_penalty
+            - 0.025 * capture_penalty
+            - 0.025 * zero_penalty
+        ))
+        negative_nse_penalty += weight * max(0.0, -row["nse"])
+        total_weight += weight
+    mean_score = sum(weight * score for weight, score in station_scores) / total_weight
+    worst_score = min(score for _weight, score in station_scores)
+    return mean_score + 0.12 * worst_score - 0.30 * negative_nse_penalty / total_weight
 
 
 def print_result(result: dict[str, dict[str, float]]) -> None:
@@ -838,7 +1034,7 @@ def print_result(result: dict[str, dict[str, float]]) -> None:
             f"{name}: R2={row['r2']:.4f} NSE={row['nse']:.4f} "
             f"KGE={row['kge']:.4f} PBIAS={row['pbias']:.2f}"
         )
-    print(f"Combined KGE score (sediment x3)={combined_score(result):.4f}")
+    print(f"Equal-weight mean KGE={combined_score(result):.4f}")
 
 
 def command_single(args: argparse.Namespace) -> None:
@@ -846,6 +1042,8 @@ def command_single(args: argparse.Namespace) -> None:
     if args.model_in:
         params = parse_model_in(Path(args.model_in))
     else:
+        if args.sim_id is None:
+            raise ValueError("Supply --model-in or explicitly select --sim-id")
         names = [row[0] for row in parse_par_inf(project / "SUFI2.IN" / "par_inf.txt")]
         rows = parse_par_val(project / "SUFI2.IN" / "par_val.txt")
         row_map = {sim_id: values for sim_id, values in rows}
@@ -869,6 +1067,7 @@ def sample_values(
     rng = rng or random
     values: list[float] = []
     for (_, lo, hi), c in zip(ranges, center):
+        c = max(lo, min(hi, c))
         span = (hi - lo) * scale
         a = max(lo, c - span)
         b = min(hi, c + span)
@@ -876,18 +1075,20 @@ def sample_values(
     return values
 
 
-def score_result(result: dict[str, dict[str, float]], score_mode: str, sediment_weight: float) -> float:
-    if score_mode == "sediment":
-        return sediment_shape_score(result)
-    if score_mode == "hhb_flow":
-        return hhb_flow_score(result)
-    return combined_score(result, sediment_weight=sediment_weight)
+def score_result(
+    result: dict[str, dict[str, float]],
+    score_mode: str,
+    variable_weights: dict[str, float],
+) -> float:
+    if score_mode == "multisite_timeseries":
+        return multisite_timeseries_score(result, variable_weights)
+    return combined_score(result, variable_weights)
 
 
 def metric_fieldnames(variable_names: list[str]) -> list[str]:
     names: list[str] = []
     for variable in variable_names:
-        names.extend([f"{variable}_r2", f"{variable}_nse", f"{variable}_kge", f"{variable}_pbias"])
+        names.extend([f"{variable}_{key}" for key in PROCESS_METRIC_KEYS])
     return names
 
 
@@ -898,22 +1099,34 @@ def flatten_result(
     result: dict[str, dict[str, float]],
     variable_names: list[str],
     elapsed: float,
+    status: str,
+    error: str,
 ) -> dict[str, float | int | str]:
-    row: dict[str, float | int | str] = {"run": run_id, "score": score, "elapsed_seconds": elapsed}
+    row: dict[str, float | int | str] = {
+        "run": run_id,
+        "status": status,
+        "error": error,
+        "score": score,
+        "elapsed_seconds": elapsed,
+    }
     for i, value in enumerate(values, start=1):
         row[f"par_{i}"] = value
     for variable in variable_names:
         metric_row = result.get(variable, {})
-        for key in ("r2", "nse", "kge", "pbias"):
+        for key in PROCESS_METRIC_KEYS:
             row[f"{variable}_{key}"] = metric_row.get(key, float("nan"))
     return row
 
 
 def load_ranges_and_center(args: argparse.Namespace, project: Path) -> tuple[list[tuple[str, float, float]], list[str], list[float]]:
     project = Path(args.project).resolve()
+    if not math.isfinite(args.scale) or args.scale <= 0.0:
+        raise ValueError("--scale must be finite and positive")
     ranges = parse_par_inf(Path(args.par_inf).resolve()) if args.par_inf else parse_par_inf(project / "SUFI2.IN" / "par_inf.txt")
     names = [row[0] for row in ranges]
-    if args.center_model_in:
+    if getattr(args, "center_zero", False):
+        center = [0.0 for _ in ranges]
+    elif args.center_model_in:
         center_values = parse_model_values(Path(args.center_model_in).resolve())
         center = [center_values.get(name, (lo + hi) / 2.0) for name, lo, hi in ranges]
     else:
@@ -933,8 +1146,9 @@ def run_sample_batch(
     scale: float,
     observed_path: Path | None,
     score_mode: str,
-    sediment_weight: float,
+    variable_weights: dict[str, float],
     variable_names: list[str],
+    series_dir: Path | None = None,
     progress: bool = False,
 ) -> list[dict[str, float | int | str]]:
     names = [row[0] for row in ranges]
@@ -944,24 +1158,54 @@ def run_sample_batch(
         values = sample_values(ranges, center, scale, rng)
         params = params_from_names_values(names, values)
         started = time.time()
-        apply_parameters(project, params)
-        run_model(project)
-        result = evaluate_outputs(project, observed_path)
-        score = score_result(result, score_mode, sediment_weight)
+        status = "ok"
+        error = ""
+        try:
+            apply_parameters(project, params)
+            run_model(project)
+            result = evaluate_outputs(project, observed_path)
+            score = score_result(result, score_mode, variable_weights)
+            if series_dir is not None:
+                series_dir.mkdir(parents=True, exist_ok=True)
+                series_rows: list[tuple[str, list[float]]] = []
+                for variable in variable_names:
+                    series_rows.append((variable, read_simulated_series(project / "SUFI2.OUT" / f"{variable}.txt")))
+                series_length = max((len(values) for _, values in series_rows), default=0)
+                series_path = series_dir / f"run_{run_id:04d}_series.csv"
+                temporary_path = series_path.with_suffix(series_path.suffix + ".tmp")
+                with temporary_path.open("w", newline="", encoding="utf-8") as series_handle:
+                    series_writer = csv.writer(series_handle)
+                    series_writer.writerow(["variable", *[f"t{i}" for i in range(1, series_length + 1)]])
+                    for variable, values_row in series_rows:
+                        series_writer.writerow([variable, *values_row])
+                temporary_path.replace(series_path)
+        except Exception as exc:
+            result = {
+                variable: {key: float("nan") for key in PROCESS_METRIC_KEYS}
+                for variable in variable_names
+            }
+            score = -999.0
+            status = "failed"
+            error = f"{type(exc).__name__}: {exc}"
+            with (project / "direct_failed_runs.log").open("a", encoding="utf-8") as handle:
+                handle.write(f"run={run_id}\t{error}\n")
         elapsed = time.time() - started
-        rows.append(flatten_result(run_id, score, values, result, variable_names, elapsed))
+        rows.append(flatten_result(run_id, score, values, result, variable_names, elapsed, status, error))
+        write_rows_csv(project / "direct_partial_results.csv", rows, names, variable_names)
         if progress:
-            sed = result.get("SED_CONC_7", {})
+            valid_kge = [row["kge"] for row in result.values() if math.isfinite(row["kge"])]
+            mean_kge = sum(valid_kge) / len(valid_kge) if valid_kge else float("nan")
             print(
                 f"run {offset}/{len(run_ids)} (global {run_id}): score={score:.4f} "
-                f"SED KGE={sed.get('kge', float('nan')):.4f} "
-                f"NSE={sed.get('nse', float('nan')):.4f} elapsed={elapsed:.1f}s",
+                f"mean_KGE={mean_kge:.4f} elapsed={elapsed:.1f}s",
                 flush=True,
             )
     return rows
 
 
 def copy_worker_project(source_project: Path, worker_root: Path, worker_index: int, refresh: bool) -> Path:
+    if worker_root == source_project or source_project in worker_root.parents:
+        raise ValueError(f"Worker directory must be outside the source project: {worker_root}")
     dest = worker_root / f"worker_{worker_index:02d}"
     if refresh and dest.exists():
         shutil.rmtree(dest)
@@ -972,6 +1216,9 @@ def copy_worker_project(source_project: Path, worker_root: Path, worker_index: i
             "direct_edit_log.txt",
             "output.*",
             "swat_output.txt",
+            "Iterations",
+            "Calibration_Evidence",
+            "Parameter_Ranges",
         )
         shutil.copytree(source_project, dest, ignore=ignore)
     (dest / "SUFI2.OUT").mkdir(exist_ok=True)
@@ -994,21 +1241,78 @@ def write_rows_csv(
 ) -> None:
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     with out_csv.open("w", newline="", encoding="utf-8") as handle:
-        fieldnames = ["run", "score", "elapsed_seconds"] + [f"par_{i + 1}" for i in range(len(names))]
+        fieldnames = ["run", "status", "error", "score", "elapsed_seconds"] + [f"par_{i + 1}" for i in range(len(names))]
         fieldnames.extend(metric_fieldnames(variable_names))
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
 
+def select_best_row(
+    rows: list[dict[str, float | int | str]],
+    variable_names: list[str],
+    variable_weights: dict[str, float],
+    min_station_nse: float | None,
+    min_station_kge: float | None,
+) -> tuple[dict[str, float | int | str], int]:
+    successful = [row for row in rows if row.get("status") == "ok"]
+    if not successful:
+        raise RuntimeError(f"All {len(rows)} sample attempts failed")
+    if min_station_nse is None and min_station_kge is None:
+        return max(successful, key=lambda row: float(row["score"])), len(successful)
+
+    feasible = [
+        row for row in successful
+        if all(
+            (min_station_nse is None or float(row[f"{variable}_nse"]) >= min_station_nse)
+            and (min_station_kge is None or float(row[f"{variable}_kge"]) >= min_station_kge)
+            for variable in variable_names
+        )
+    ]
+    if not feasible:
+        raise RuntimeError("No successful run met every station threshold; no best_model.in was exported")
+
+    def hierarchy(row: dict[str, float | int | str]) -> tuple[float, float, float, float]:
+        kge_values = [float(row[f"{variable}_kge"]) for variable in variable_names]
+        nse_values = [float(row[f"{variable}_nse"]) for variable in variable_names]
+        weighted_mean_kge = sum(
+            float(row[f"{variable}_kge"]) * variable_weights[variable]
+            for variable in variable_names
+        ) / sum(variable_weights.values())
+        return (
+            float(row["score"]),
+            weighted_mean_kge,
+            min(kge_values),
+            min(nse_values),
+        )
+
+    return max(feasible, key=hierarchy), len(feasible)
+
+
 def command_sample(args: argparse.Namespace) -> None:
     project = Path(args.project).resolve()
+    if args.runs < 1 or args.workers < 1:
+        raise ValueError("--runs and --workers must be positive")
     ranges, names, center = load_ranges_and_center(args, project)
     observed_path = Path(args.observed_rch).resolve() if args.observed_rch else None
     observed_for_names = observed_path or project / "SUFI2.IN" / "observed_rch.txt"
     variable_names = list(read_observed_blocks(observed_for_names).keys())
+    variable_weights = parse_variable_weights(args.variable_weights, variable_names)
+    print(
+        "Variable weights: "
+        + ", ".join(f"{name}={variable_weights[name]:g}" for name in variable_names)
+    )
     out_csv = Path(args.out_csv).resolve()
     out_csv.parent.mkdir(parents=True, exist_ok=True)
+    series_dir = Path(args.series_dir).resolve() if args.series_dir else None
+    best_path = out_csv.with_suffix(".best_model.in")
+    if best_path.exists():
+        best_path.unlink()
+    max_attempts = args.max_attempts or args.runs
+    if max_attempts < args.runs:
+        raise ValueError("--max-attempts cannot be smaller than --runs")
+    worker_root: Path | None = None
+    retry_project = project
 
     if args.workers <= 1:
         rows = run_sample_batch(
@@ -1020,12 +1324,18 @@ def command_sample(args: argparse.Namespace) -> None:
             args.scale,
             observed_path,
             args.score_mode,
-            args.sediment_weight,
+            variable_weights,
             variable_names,
+            series_dir,
             progress=True,
         )
     else:
-        worker_root = Path(args.workers_dir).resolve() if args.workers_dir else out_csv.with_suffix("").parent / f"{out_csv.stem}_workers"
+        if args.workers_dir:
+            worker_root = Path(args.workers_dir).resolve()
+        else:
+            worker_root = out_csv.parent / f"{out_csv.stem}_workers"
+            if worker_root == project or project in worker_root.parents:
+                worker_root = project.parent / f"{project.name}_{out_csv.stem}_workers"
         worker_root.mkdir(parents=True, exist_ok=True)
         futures = []
         rows = []
@@ -1035,6 +1345,8 @@ def command_sample(args: argparse.Namespace) -> None:
                 if not run_ids:
                     continue
                 worker_project = copy_worker_project(project, worker_root, worker_index, args.refresh_workers)
+                if worker_index == 1:
+                    retry_project = worker_project
                 futures.append(
                     executor.submit(
                         run_sample_batch,
@@ -1046,8 +1358,9 @@ def command_sample(args: argparse.Namespace) -> None:
                         args.scale,
                         observed_path,
                         args.score_mode,
-                        args.sediment_weight,
+                        variable_weights,
                         variable_names,
+                        series_dir,
                         False,
                     )
                 )
@@ -1056,39 +1369,94 @@ def command_sample(args: argparse.Namespace) -> None:
                 rows.extend(batch_rows)
                 print(f"finished worker batch with {len(batch_rows)} runs", flush=True)
         rows.sort(key=lambda item: int(item["run"]))
-        if args.cleanup_workers:
-            shutil.rmtree(worker_root)
+    successful_count = sum(row.get("status") == "ok" for row in rows)
+    while successful_count < args.runs and len(rows) < max_attempts:
+        batch_size = min(args.runs - successful_count, max_attempts - len(rows))
+        start_id = len(rows) + 1
+        retry_rows = run_sample_batch(
+            retry_project,
+            list(range(start_id, start_id + batch_size)),
+            ranges,
+            center,
+            args.seed,
+            args.scale,
+            observed_path,
+            args.score_mode,
+            variable_weights,
+            variable_names,
+            series_dir,
+            progress=True,
+        )
+        rows.extend(retry_rows)
+        successful_count = sum(row.get("status") == "ok" for row in rows)
+        write_rows_csv(out_csv, rows, names, variable_names)
+
+    failed_count = len(rows) - successful_count
+    print(
+        f"Sampling summary: attempted={len(rows)} succeeded={successful_count} "
+        f"failed={failed_count} target={args.runs}",
+        flush=True,
+    )
+    if args.cleanup_workers and worker_root is not None:
+        shutil.rmtree(worker_root)
 
     write_rows_csv(out_csv, rows, names, variable_names)
-    if rows:
-        best_row = max(rows, key=lambda item: float(item["score"]))
-        print(f"Best run={best_row['run']} score={float(best_row['score']):.4f}")
-        for variable in variable_names:
-            print(
-                f"{variable}: R2={float(best_row[f'{variable}_r2']):.4f} "
-                f"NSE={float(best_row[f'{variable}_nse']):.4f} "
-                f"KGE={float(best_row[f'{variable}_kge']):.4f} "
-                f"PBIAS={float(best_row[f'{variable}_pbias']):.2f}"
-            )
-        best_path = out_csv.with_suffix(".best_model.in")
-        write_best_model(best_path, names, best_row)
-        print(f"Best model.in: {best_path}")
+    if successful_count < args.runs:
+        raise RuntimeError(
+            f"Only {successful_count}/{args.runs} successful runs after {len(rows)} attempts; "
+            "fix logged failures or increase --max-attempts"
+        )
+
+    best_row, feasible_count = select_best_row(
+        rows, variable_names, variable_weights, args.min_station_nse, args.min_station_kge
+    )
+    if args.min_station_nse is not None or args.min_station_kge is not None:
+        print(f"Threshold-feasible runs={feasible_count}/{successful_count} successful")
+        mean_kge = sum(
+            float(best_row[f"{name}_kge"]) * variable_weights[name] for name in variable_names
+        ) / sum(variable_weights.values())
+        print(
+            f"Selection hierarchy: thresholds passed; configured score={float(best_row['score']):.4f}; "
+            f"weighted mean KGE={mean_kge:.4f}"
+        )
+    print(f"Best run={best_row['run']} score={float(best_row['score']):.4f}")
+    for variable in variable_names:
+        print(
+            f"{variable}: R2={float(best_row[f'{variable}_r2']):.4f} "
+            f"NSE={float(best_row[f'{variable}_nse']):.4f} "
+            f"KGE={float(best_row[f'{variable}_kge']):.4f} "
+            f"PBIAS={float(best_row[f'{variable}_pbias']):.2f}"
+        )
+    write_best_model(best_path, names, best_row)
+    print(f"Best model.in: {best_path}")
 
 
 def command_plan(args: argparse.Namespace) -> None:
     project = Path(args.project).resolve()
-    ranges, _names, center = load_ranges_and_center(args, project)
+    ranges, names, center = load_ranges_and_center(args, project)
+    if args.center_model_in:
+        center_values = parse_model_values(Path(args.center_model_in).resolve())
+        missing = [name for name in names if name not in center_values]
+        if missing:
+            raise ValueError(f"Center model is missing {len(missing)} active parameters: {missing[:5]}")
     out_par_val = Path(args.out_par_val).resolve()
     out_par_val.parent.mkdir(parents=True, exist_ok=True)
     lines: list[str] = []
-    for run_id in range(1, args.runs + 1):
+    first_random_run = 1
+    if args.center_model_in and args.runs >= 1:
+        lines.append(f"{1:<8d}" + "".join(f"{value:14.6f}" for value in center))
+        first_random_run = 2
+    for run_id in range(first_random_run, args.runs + 1):
         values = sample_values(ranges, center, args.scale, random.Random(args.seed + run_id * 104729))
         lines.append(f"{run_id:<8d}" + "".join(f"{value:14.6f}" for value in values))
     out_par_val.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"Wrote {args.runs} rows to {out_par_val}")
+    suffix = " with exact center in row 1" if args.center_model_in else ""
+    print(f"Wrote {args.runs} rows to {out_par_val}{suffix}")
 
 
 def command_shrink(args: argparse.Namespace) -> None:
+    if not math.isfinite(args.factor) or args.factor <= 0.0:
+        raise ValueError("--factor must be finite and positive")
     par_inf = Path(args.par_inf).resolve()
     ranges = parse_par_inf(par_inf)
     best_row: dict[str, str] | None = None
@@ -1163,6 +1531,8 @@ def command_reservoir_scope(args: argparse.Namespace) -> None:
 
     rows = conservative_res_parameter_rows(project, scopes)
     if args.out_par_inf:
+        if args.runs is None or args.runs < 1:
+            raise ValueError("--runs must be positive when --out-par-inf is used")
         out_path = Path(args.out_par_inf).resolve()
         out_path.parent.mkdir(parents=True, exist_ok=True)
         lines = [
@@ -1182,12 +1552,13 @@ def command_reservoir_scope(args: argparse.Namespace) -> None:
 
 def add_sampling_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--project", required=True)
-    parser.add_argument("--runs", type=int, default=10)
-    parser.add_argument("--center-sim", type=int, default=166)
+    parser.add_argument("--runs", type=int, required=True)
+    parser.add_argument("--center-sim", type=int)
     parser.add_argument("--center-model-in")
+    parser.add_argument("--center-zero", action="store_true", help="Use zero as the center for relative/additive searches.")
     parser.add_argument("--par-inf")
-    parser.add_argument("--scale", type=float, default=0.15)
-    parser.add_argument("--seed", type=int, default=20260710)
+    parser.add_argument("--scale", type=float, required=True)
+    parser.add_argument("--seed", type=int, default=0)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1196,21 +1567,36 @@ def build_parser() -> argparse.ArgumentParser:
 
     single = sub.add_parser("single")
     single.add_argument("--project", required=True)
-    single.add_argument("--sim-id", type=int, default=166)
+    single.add_argument("--sim-id", type=int)
     single.add_argument("--model-in")
     single.add_argument("--observed-rch")
     single.set_defaults(func=command_single)
 
     sample = sub.add_parser("sample")
     add_sampling_arguments(sample)
-    sample.add_argument("--sediment-weight", type=float, default=3.0)
-    sample.add_argument("--score-mode", choices=["kge", "sediment", "hhb_flow"], default="kge")
+    sample.add_argument(
+        "--score-mode",
+        choices=["kge", "multisite_timeseries"],
+        default="kge",
+    )
+    sample.add_argument(
+        "--variable-weights",
+        help="Optional comma-separated observation-block weights, for example NAME_A=2,NAME_B=1.",
+    )
     sample.add_argument("--out-csv", required=True)
     sample.add_argument("--observed-rch")
     sample.add_argument("--workers", type=int, default=1)
     sample.add_argument("--workers-dir")
     sample.add_argument("--refresh-workers", action="store_true")
     sample.add_argument("--cleanup-workers", action="store_true")
+    sample.add_argument("--series-dir", help="Optional directory for per-run hydrographs used to build 95PPU.")
+    sample.add_argument(
+        "--max-attempts",
+        type=int,
+        help="Maximum attempts used to obtain --runs successful simulations (default: same as --runs).",
+    )
+    sample.add_argument("--min-station-nse", type=float, help="Require every station to meet this NSE.")
+    sample.add_argument("--min-station-kge", type=float, help="Require every station to meet this KGE.")
     sample.set_defaults(func=command_sample)
 
     plan = sub.add_parser("plan")
@@ -1222,17 +1608,17 @@ def build_parser() -> argparse.ArgumentParser:
     shrink.add_argument("--par-inf", required=True)
     shrink.add_argument("--results-csv", required=True)
     shrink.add_argument("--out-par-inf", required=True)
-    shrink.add_argument("--factor", type=float, default=0.2)
+    shrink.add_argument("--factor", type=float, required=True)
     shrink.add_argument("--score-column", default="score")
     shrink.set_defaults(func=command_shrink)
 
     reservoir_parser = sub.add_parser("reservoir-scope")
     reservoir_parser.add_argument("--project", required=True)
-    reservoir_parser.add_argument("--stations", help="Comma/range station ids, e.g. 2,7,14-17. Defaults to FLOW_OUT_* in observed_rch.txt.")
+    reservoir_parser.add_argument("--stations", help="Comma/range station ids. Defaults to FLOW_OUT_* blocks in observed_rch.txt.")
     reservoir_parser.add_argument("--observed-rch")
     reservoir_parser.add_argument("--fig")
     reservoir_parser.add_argument("--out-par-inf")
-    reservoir_parser.add_argument("--runs", type=int, default=50)
+    reservoir_parser.add_argument("--runs", type=int, help="Simulation count written to --out-par-inf.")
     reservoir_parser.set_defaults(func=command_reservoir_scope)
     return parser
 

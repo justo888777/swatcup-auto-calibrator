@@ -1,3 +1,4 @@
 interface:
   display_name: "SWAT-CUP Auto Calibrator"
-  short_description: "Automate SWAT-CUP SUFI2 calibration, including conservative reservoir scope checks."
+  short_description: "Diagnose and automate multi-site SWAT-CUP calibration"
+  default_prompt: "Use $swatcup-auto-calibrator to derive topology and run settings from this project, calibrate and diagnose it, then prepare a native GUI-runnable SWAT-CUP project."

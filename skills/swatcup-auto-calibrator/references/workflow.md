@@ -1,29 +1,53 @@
-# Workflow / 工作流程
+# End-to-end workflow
 
-## English
+## 1. Establish a reproducible baseline
 
-Use this workflow for SWAT-CUP SUFI2 projects when the user wants calibration without GUI clicking.
+Work in a complete copy. Record the active executable set, observation file, simulation period, warm-up assumptions, active `par_inf.txt`, and accepted direct-only input changes. Confirm `DirectBase/` represents the intended non-cumulative baseline.
 
-1. Start with a clean project copy. Keep the original project readable and write experiments into a separate folder.
-2. Check `SUFI2.IN/par_inf.txt` to identify the active parameter set and bounds.
-3. Check `SUFI2.IN/observed_rch.txt` to identify stations and variables.
-4. Run a single reproduction using a known `model.in` before sampling.
-5. Run small sampling first, usually 10 to 50 runs, to verify that metrics and outputs are parsed correctly.
-6. When a station may be reservoir affected, run `reservoir-scope` with the station ids. Include only reservoirs that the command reports as local or upstream from `fig.fig`.
-7. Keep `.res` co-calibration mild: do not vary `IRESCO` by default; vary only physically interpretable release, target storage, evaporation, seepage, existing water-use months, and existing outflow constraints.
-8. Increase to larger sampling only after outputs and objective metrics are plausible.
-9. For paper-ready work, split observed files by calibration and validation periods and evaluate both periods explicitly.
-10. For SWAT-CUP GUI 95PPU, generate `par_val.txt` with `plan`, then run the full SWAT-CUP workflow in the GUI if needed. If the GUI cannot apply `.res` fields, write fixed reservoir files into both the project root and `Backup/` and keep `par_inf.txt` GUI-compatible.
+Replay the current best `model.in` once. The metrics and time series must match the claimed baseline before optimization begins. A mismatch usually means stale worker copies, the wrong baseline, unsupported edit syntax, a different executable, or a changed structural input.
 
-## 中文
+## 2. Audit structure before expanding parameter ranges
 
-当用户希望跳过 SWAT-CUP 图形界面进行 SUFI2 率定时，按下面流程执行。
+Run `audit_structure.py` and manually verify its assumptions, especially WUS units. Use `fig.fig` to answer:
 
-1. 先复制一份干净工程，原始工程尽量只读，测试结果写到单独目录。
-2. 检查 `SUFI2.IN/par_inf.txt`，确认参与率定的参数和范围。
-3. 检查 `SUFI2.IN/observed_rch.txt`，确认站点、变量和观测长度。
-4. 用已知 `model.in` 先做单次复现，确认输出指标能被正确读取。
-5. 先做 10 到 50 次小样本测试，确认 SWAT 输出、SUFI2 提取和评价指标没有异常。
-6. 小样本正常后，再扩大到几百或几千次采样。
-7. 论文场景要把率定期和验证期观测文件分开，分别计算指标。
-8. 如果需要 SWAT-CUP 软件中的 95PPU，用 `plan` 生成 `par_val.txt`，再放入 GUI 工程运行。
+- Which observed stations share upstream area?
+- Which stations are genuinely independent branches?
+- Is a reservoir upstream of the extracted reach, or downstream of the gauge?
+- Are `recmon`, `recday`, or constant records active, complete, correctly dated, and in the expected units?
+- Are withdrawals and return flows plausible relative to observed mean and low flow?
+
+If a simulated line slowly rises while observed flow has sharp released-flow peaks, inspect reservoir operations and extraction location before widening groundwater parameters. If baseflow collapses or zeros appear, inspect WUS and return flow before forcing aquifer parameters to compensate.
+
+## 3. Size the experiment from the current task
+
+Run a small canary using the exact planned baseline, ranges, executable, worker layout, and observation file. Size it from parameter dimension, runtime, and the amount of evidence needed to expose execution failures. Confirm every observation block has the expected period count and reasonable metrics.
+
+Then run the task's requested number of successful simulations. If no count was requested, choose one from parameter dimension, runtime, convergence behavior, and the calibration stage, and state that choice explicitly. Derive `--max-attempts` from the canary failure rate plus a stated margin; never import either count from another basin. The command exits nonzero if it cannot reach `--runs` successful simulations. Enable `--series-dir`; summary metrics alone cannot reconstruct 95PPU or diagnose hydrograph shape.
+
+## 4. Select candidates without gaming the score
+
+Resolve variable weights and thresholds from the current request or project configuration. Do not reuse weights from another calibration. If none are defined, state the neutral convention used by the run. Selection should be hierarchical:
+
+1. Reject failed runs, wrong output lengths, and visibly invalid processes.
+2. Enforce the explicit variable-level constraints for this task.
+3. Compare the configured aggregate objective within the threshold-feasible set.
+4. Break ties with the process-aware score and then worst-station KGE/NSE.
+5. Inspect correlation, log-NSE, PBIAS, seasonal climatology, peak timing, top-decile peak capture, low-flow ratio, and simulated zero fraction before acceptance.
+
+`multisite_timeseries` is a search score, not an acceptance certificate. Set non-equal current-task weights with `--variable-weights NAME=WEIGHT,...`; omission means an explicitly chosen equal-weight objective. When thresholds are supplied, no feasible run means failure and no `best_model.in`; feasible candidates are ordered first by the configured score, then by weighted mean KGE and worst-variable diagnostics. Always inspect the per-variable metrics and charts.
+
+## 5. Narrow ranges conservatively
+
+Choose `--scale` and shrink `--factor` for the current parameter ranges and calibration stage; both are explicit inputs rather than inherited defaults. Narrow parameters only when repeated samples show a stable direction and the change has a physically credible effect. Avoid shrinking a weak station around a statistically convenient but structurally wrong solution. When the best value lies on a bound, decide whether the bound is physically artificial or the structure is forcing compensation.
+
+For formal GUI sampling, keep all sensitive and GUI-supported parameters relevant to the full station set. A small direct search can use direct-only fields, but accepted values must be baked and removed from the GUI-active set if Swat_Edit cannot edit them reliably.
+
+## 6. Replay and package
+
+Any station-specific parameter mosaic must be replayed once as a complete model. Recheck downstream stations because upstream edits propagate. Save the final process series and rebuild metrics and 95PPU.
+
+Use `plan` to create a `par_val.txt` with exactly the formal run count requested for the current task. Put the verified best parameter set in the first row when the intended workflow relies on it, while keeping later rows exploratory. Apply native-delivery checks in `native-gui-delivery.md`.
+
+## 7. Calibration versus validation
+
+Metrics over the entire observation period are calibration diagnostics, not independent validation. For publication-grade claims, use an explicit temporal split or a separate validation period and report both.
