@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "swatcup-auto-calibrator"
-version = "1.1.0"
+version = "1.1.1"
 description = "Process-aware SWAT-CUP SUFI2 calibration with isolated sampling, topology audits, and conservative WUS/reservoir co-calibration."
 readme = "README.md"
 requires-python = ">=3.10"

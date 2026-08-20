@@ -6,9 +6,11 @@ Process-aware, GUI-free SWAT-CUP/SUFI2 calibration for multi-station projects.
 
 无需持续操作 SWAT-CUP 图形界面。工具可直接复现 `model.in`、在相互隔离的工程副本中采样、计算逐站 R2/NSE/KGE/PBIAS 与时序诊断指标，并准备可由原生 BAT 和 GUI 继续运行的工程。
 
-## Version 1.1.0
+## Version 1.1.1
 
-This release expands the original runner into a complete calibration and delivery workflow:
+1.1.1 clears root-level SWAT outputs before every simulation. This fixes reused workers whose later samples could disagree with a clean replay even when parameter inputs and `DirectBase/` were identical.
+
+The 1.1 series expands the original runner into a complete calibration and delivery workflow:
 
 - Multi-station process diagnostics: correlation, log-NSE, monthly climatology, lag, peak offset, peak capture, low-flow ratio, and false-zero detection.
 - Saved per-run hydrographs and strict station-specific 95PPU ensemble construction.
@@ -22,7 +24,7 @@ This release expands the original runner into a complete calibration and deliver
 
 ## Safety Model
 
-SWAT and SUFI2 write fixed file names. Never run concurrent simulations in one project directory. Each worker receives a full project copy and restores only the files touched by the active parameter set.
+SWAT and SUFI2 write fixed file names. Never run concurrent simulations in one project directory. Each worker receives a full project copy, restores the files touched by the active parameter set, and clears generated SWAT outputs before every run so reused workers remain replayable.
 
 Keep the source project unchanged. Reproduce one known parameter set before sampling, derive station and reservoir scope from the current `fig.fig`, and replay the selected whole-model combination before delivery. Direct-only `.sol`, `.wus`, and `.res` edits should be baked into the root project, `Backup/`, and `DirectBase/` when the installed Swat_Edit cannot change them.
 

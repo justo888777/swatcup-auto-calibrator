@@ -771,6 +771,24 @@ def clear_sufi2_out(project: Path) -> None:
             path.unlink()
 
 
+def clear_swat_outputs(project: Path) -> None:
+    patterns = (
+        "output.*",
+        "input.std",
+        "fin.fin",
+        "watout.dat",
+        "hyd.out",
+        "chan.deg",
+        "bmp-*.out",
+        "septic.out",
+        "swat_output.txt",
+    )
+    for pattern in patterns:
+        for path in project.glob(pattern):
+            if path.is_file():
+                path.unlink()
+
+
 def run_program(project: Path, exe: str, log_name: str) -> None:
     with (project / log_name).open("w", encoding="utf-8", errors="ignore") as log:
         result = subprocess.run(
@@ -788,6 +806,7 @@ def run_program(project: Path, exe: str, log_name: str) -> None:
 
 def run_model(project: Path) -> None:
     clear_sufi2_out(project)
+    clear_swat_outputs(project)
     run_program(project, "swat.exe", "direct_swat.log")
     run_program(project, "SUFI2_extract_rch.exe", "direct_extract.log")
 

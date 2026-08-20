@@ -5,6 +5,7 @@ from pathlib import Path
 from swatcup_auto.runner import (
     INTEGER_PIPE_PARAMETERS,
     ReservoirScope,
+    clear_swat_outputs,
     conservative_res_parameter_rows,
     copy_worker_project,
     parse_par_inf,
@@ -47,6 +48,21 @@ class RunnerTests(unittest.TestCase):
         project.mkdir()
         with self.assertRaisesRegex(ValueError, "outside the source project"):
             copy_worker_project(project, project / "results" / "workers", 1, False)
+
+    def test_swat_outputs_are_removed_before_each_run(self) -> None:
+        removable = (
+            "output.rch", "input.std", "fin.fin", "watout.dat", "hyd.out",
+            "chan.deg", "bmp-ri.out", "septic.out", "swat_output.txt",
+        )
+        for name in removable:
+            (self.directory / name).write_text("stale", encoding="utf-8")
+        control = self.directory / "file.cio"
+        control.write_text("keep", encoding="utf-8")
+
+        clear_swat_outputs(self.directory)
+
+        self.assertTrue(control.exists())
+        self.assertFalse(any((self.directory / name).exists() for name in removable))
 
     def test_reservoir_ranges_keep_months_and_editor_limits(self) -> None:
         project = self.directory

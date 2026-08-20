@@ -9,7 +9,7 @@ SWAT and SUFI2 write fixed names such as `output.rch`, extracted `FLOW_OUT_*.txt
 1. Benchmark one complete simulation, including extraction and first-start overhead.
 2. Choose a worker count from measured single-run cost, disk throughput, memory, CPU, and executable behavior. Record the chosen value for the current project; do not carry it across projects without remeasuring.
 3. Refresh workers after changes to observations, executables, `fig.fig`, `DirectBase/`, `Backup/`, control files, or structural inputs.
-4. Restore only files touched by the active parameters before each run. Full-folder restores create unnecessary disk contention.
+4. Restore only files touched by the active parameters before each run, and delete root-level SWAT outputs plus `SUFI2.OUT` before launching `swat.exe`. Stale generated files can make a reused worker disagree with a clean replay. Full-folder restores create unnecessary disk contention.
 5. Give each run a deterministic ID and seed. Save worker-local partial CSVs immediately after each result.
 6. Merge only completed rows and retain failures with their messages. Rerun missing IDs in fresh worker copies.
 
