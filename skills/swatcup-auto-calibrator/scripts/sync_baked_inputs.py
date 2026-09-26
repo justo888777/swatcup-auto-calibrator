@@ -14,10 +14,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--project", type=Path, required=True)
     parser.add_argument("--model-in", type=Path, required=True)
-    parser.add_argument(
-        "--destinations",
-        help="Comma-separated baseline directories. Defaults to Backup plus DirectBase when present.",
-    )
+    parser.add_argument("--destinations", default="Backup,DirectBase")
     parser.add_argument(
         "--extensions",
         default="sol,wus,res",
@@ -43,12 +40,7 @@ def main() -> int:
         unresolved = sorted(explicit_files - set(files))
         if unresolved:
             raise ValueError(f"Explicit files were not resolved from matching model parameters: {unresolved}")
-    if args.destinations:
-        destinations = [value.strip() for value in args.destinations.split(",") if value.strip()]
-    else:
-        destinations = [name for name in ("Backup", "DirectBase") if (project / name).is_dir()]
-        if not destinations:
-            raise FileNotFoundError(f"Neither Backup nor DirectBase exists in {project}")
+    destinations = [value.strip() for value in args.destinations.split(",") if value.strip()]
     for directory_name in destinations:
         directory = project / directory_name
         if not directory.is_dir():

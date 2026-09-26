@@ -26,13 +26,23 @@ def read_wus(path: Path) -> dict[str, list[float]]:
     return {name: values[index * 12:(index + 1) * 12] for index, name in enumerate(WUS_NAMES)}
 
 
-def station_ids(observed: dict[str, list[tuple[int, float]]]) -> list[int]:
-    result: list[int] = []
+def observed_reaches(observed: dict[str, list[tuple[int, float]]]) -> dict[int, list[str]]:
+    result: dict[int, list[str]] = {}
     for name in observed:
-        match = re.fullmatch(r"FLOW_OUT_(\d+)", name)
+        match = re.fullmatch(r"(?:FLOW|SED)_(?:IN|OUT)_(\d+)", name)
         if match:
-            result.append(int(match.group(1)))
-    return sorted(result)
+            result.setdefault(int(match.group(1)), []).append(name)
+    return {reach: sorted(names) for reach, names in sorted(result.items())}
+
+
+def flow_observations(
+    observed: dict[str, list[tuple[int, float]]],
+    reach: int,
+) -> tuple[str | None, list[tuple[int, float]]]:
+    for name in (f"FLOW_OUT_{reach}", f"FLOW_IN_{reach}"):
+        if name in observed:
+            return name, observed[name]
+    return None, []
 
 
 def related_reservoirs(project: Path, nodes: dict, route_ids: list[int]) -> list[dict[str, object]]:
@@ -72,18 +82,33 @@ def read_transfer_records(path: Path) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
     for line_number, line in enumerate(path.read_text(errors="ignore").splitlines(), start=1):
         parts = line.split()
-        if not parts or parts[0].lower() != "transfer" or len(parts) < 8:
+        if not parts or parts[0].lower() != "transfer":
             continue
-        records.append({
+        record: dict[str, object] = {
             "line": line_number,
-            "source_type": int(parts[2]),
-            "source_id": int(parts[3]),
-            "destination_type": int(parts[4]),
-            "destination_id": int(parts[5]),
-            "amount": float(parts[6]),
-            "transfer_code": int(parts[7]),
-            "sequence": int(parts[8]) if len(parts) > 8 and parts[8].lstrip("+-").isdigit() else None,
-        })
+            "raw": line,
+            "tokens": parts[1:],
+        }
+        if len(parts) >= 8:
+            try:
+                record.update({
+                    "source_type": int(parts[2]),
+                    "source_id": int(parts[3]),
+                    "destination_type": int(parts[4]),
+                    "destination_id": int(parts[5]),
+                    "amount": float(parts[6]),
+                    "transfer_code": int(parts[7]),
+                    "sequence": (
+                        int(parts[8])
+                        if len(parts) > 8 and parts[8].lstrip("+-").isdigit()
+                        else None
+                    ),
+                })
+            except ValueError as exc:
+                record["parse_error"] = str(exc)
+        else:
+            record["parse_error"] = "too few tokens for the optional reach-reservoir-1-2 schema"
+        records.append(record)
     return records
 
 
@@ -120,14 +145,19 @@ def main() -> int:
     parser.add_argument(
         "--wus-unit-m3-per-day",
         type=float,
-        default=10000.0,
-        help="Cubic metres per day represented by one WUS value; verify for the model.",
+        help="Cubic metres per day represented by one WUS value. Omit when the unit is unconfirmed.",
+    )
+    parser.add_argument(
+        "--transfer-schema",
+        choices=("reach-reservoir-1-2",),
+        help="Interpret custom transfer records only after confirming the active executable's schema.",
     )
     args = parser.parse_args()
     project = args.project.resolve()
     observed_path = args.observed_rch.resolve() if args.observed_rch else project / "SUFI2.IN" / "observed_rch.txt"
     observed = read_observed_blocks(observed_path)
-    stations = station_ids(observed)
+    reach_variables = observed_reaches(observed)
+    stations = sorted(reach_variables)
     nodes = parse_fig(project / "fig.fig")
     routes: dict[int, list[int]] = {}
     for node in nodes.values():
@@ -158,44 +188,52 @@ def main() -> int:
     transfers = read_transfer_records(project / "fig.fig")
     transfer_issues: list[str] = []
     transfer_links: set[frozenset[int]] = set()
-    for transfer in transfers:
-        if transfer["source_type"] not in {1, 2} or transfer["destination_type"] not in {1, 2}:
-            transfer_issues.append(
-                f"Transfer line {transfer['line']} has invalid source/destination type; expected 1=reach or 2=reservoir"
+    if args.transfer_schema == "reach-reservoir-1-2":
+        for transfer in transfers:
+            if "parse_error" in transfer:
+                transfer_issues.append(
+                    f"Transfer line {transfer['line']} cannot be parsed with the confirmed schema: {transfer['parse_error']}"
+                )
+                transfer["source_affected_stations"] = []
+                transfer["destination_affected_stations"] = []
+                continue
+            if transfer["source_type"] not in {1, 2} or transfer["destination_type"] not in {1, 2}:
+                transfer_issues.append(
+                    f"Transfer line {transfer['line']} has a type outside the confirmed 1=reach, 2=reservoir schema"
+                )
+                transfer["source_affected_stations"] = []
+                transfer["destination_affected_stations"] = []
+                continue
+            source_op = "route" if transfer["source_type"] == 1 else "routres"
+            destination_op = "route" if transfer["destination_type"] == 1 else "routres"
+            source_nodes = {
+                node.node_id for node in nodes.values()
+                if node.op == source_op and node.object_id == transfer["source_id"]
+            }
+            destination_nodes = {
+                node.node_id for node in nodes.values()
+                if node.op == destination_op and node.object_id == transfer["destination_id"]
+            }
+            if not source_nodes:
+                transfer_issues.append(
+                    f"Transfer line {transfer['line']} source object was not resolved in fig.fig"
+                )
+            if not destination_nodes:
+                transfer_issues.append(
+                    f"Transfer line {transfer['line']} destination object was not resolved in fig.fig"
+                )
+            source_stations = sorted(
+                station for station, closure in station_closures.items() if closure & source_nodes
             )
-            transfer["source_affected_stations"] = []
-            transfer["destination_affected_stations"] = []
-            continue
-        source_op = "route" if transfer["source_type"] == 1 else "routres"
-        destination_op = "route" if transfer["destination_type"] == 1 else "routres"
-        source_nodes = {
-            node.node_id for node in nodes.values()
-            if node.op == source_op and node.object_id == transfer["source_id"]
-        }
-        destination_nodes = {
-            node.node_id for node in nodes.values()
-            if node.op == destination_op and node.object_id == transfer["destination_id"]
-        }
-        if not source_nodes:
-            transfer_issues.append(
-                f"Transfer line {transfer['line']} source object was not resolved in fig.fig"
+            destination_stations = sorted(
+                station for station, closure in station_closures.items() if closure & destination_nodes
             )
-        if not destination_nodes:
-            transfer_issues.append(
-                f"Transfer line {transfer['line']} destination object was not resolved in fig.fig"
-            )
-        source_stations = sorted(
-            station for station, closure in station_closures.items() if closure & source_nodes
-        )
-        destination_stations = sorted(
-            station for station, closure in station_closures.items() if closure & destination_nodes
-        )
-        transfer["source_affected_stations"] = source_stations
-        transfer["destination_affected_stations"] = destination_stations
-        for source_station in source_stations:
-            for destination_station in destination_stations:
-                if source_station != destination_station:
-                    transfer_links.add(frozenset({source_station, destination_station}))
+            transfer["source_affected_stations"] = source_stations
+            transfer["destination_affected_stations"] = destination_stations
+            for source_station in source_stations:
+                for destination_station in destination_stations:
+                    if source_station != destination_station:
+                        transfer_links.add(frozenset({source_station, destination_station}))
 
     remaining = set(stations)
     calibration_blocks: list[list[int]] = []
@@ -218,6 +256,13 @@ def main() -> int:
     record_inputs, record_issues = record_input_status(project, nodes)
     payload: dict[str, object] = {
         "wus_unit_assumption_m3_per_day": args.wus_unit_m3_per_day,
+        "wus_dimensional_comparison": (
+            "enabled" if args.wus_unit_m3_per_day is not None else "skipped: WUS unit was not supplied"
+        ),
+        "transfer_schema": args.transfer_schema,
+        "transfer_interpretation": (
+            "enabled" if args.transfer_schema else "skipped: records retained for manual review"
+        ),
         "stations": {},
         "station_dependencies": dependencies,
         "calibration_blocks": sorted(calibration_blocks, key=lambda block: block[0]),
@@ -230,16 +275,24 @@ def main() -> int:
     for station in stations:
         route_ids = routes.get(station, [])
         if not route_ids:
-            payload["stations"][str(station)] = {"issues": ["No matching route node in fig.fig"]}
+            payload["stations"][str(station)] = {
+                "observed_variables": reach_variables[station],
+                "issues": ["No matching route node in fig.fig"],
+            }
             continue
         closure = station_closures[station]
         sources = sorted(station_sources[station])
         monthly = {name: [0.0] * 12 for name in WUS_NAMES}
         missing_wus: list[str] = []
+        malformed_wus: list[str] = []
         for source in sources:
             path = project / f"{source:05d}0000.wus"
             if path.exists():
-                data = read_wus(path)
+                try:
+                    data = read_wus(path)
+                except (OSError, ValueError) as exc:
+                    malformed_wus.append(f"{path.name}: {exc}")
+                    data = {name: [0.0] * 12 for name in WUS_NAMES}
             else:
                 missing_wus.append(path.name)
                 data = {name: [0.0] * 12 for name in WUS_NAMES}
@@ -251,32 +304,53 @@ def main() -> int:
                 "annual_wurch_units": sum(data["WURCH"]),
                 "annual_wushal_units": sum(data["WUSHAL"]),
             })
-        river_max = max(monthly["WURCH"]) * args.wus_unit_m3_per_day / seconds_per_day
-        shallow_max = max(monthly["WUSHAL"]) * args.wus_unit_m3_per_day / seconds_per_day
-        obs_values = [value for _, value in observed[f"FLOW_OUT_{station}"]]
-        obs_mean = sum(obs_values) / len(obs_values)
-        combined_ratio = (river_max + shallow_max) / obs_mean if obs_mean > 0 else math.inf
+        flow_name, flow_series = flow_observations(observed, station)
+        obs_values = [value for _, value in flow_series]
+        obs_mean = sum(obs_values) / len(obs_values) if obs_values else None
+        river_max_units = max(monthly["WURCH"])
+        shallow_max_units = max(monthly["WUSHAL"])
+        river_max = None
+        shallow_max = None
+        combined_ratio = None
+        if args.wus_unit_m3_per_day is not None:
+            river_max = river_max_units * args.wus_unit_m3_per_day / seconds_per_day
+            shallow_max = shallow_max_units * args.wus_unit_m3_per_day / seconds_per_day
+            if obs_mean is not None:
+                combined_ratio = (river_max + shallow_max) / obs_mean if obs_mean > 0 else math.inf
         reservoirs = related_reservoirs(project, nodes, route_ids)
         issues: list[str] = []
+        notes: list[str] = []
         if missing_wus:
             issues.append(f"Missing WUS files for upstream subbasins: {missing_wus[:10]}")
+        if malformed_wus:
+            issues.append(f"Unrecognized WUS layout; dimensional totals exclude these files: {malformed_wus[:5]}")
         if any(row["relation"] == "downstream_of_gauge" for row in reservoirs):
             issues.append("Reservoir is downstream of extracted reach; verify gauge location and output variable")
-        if combined_ratio > 1.0:
+        if combined_ratio is not None and combined_ratio > 1.0:
             issues.append("Maximum WUS river+shallow withdrawal exceeds mean observed flow")
+        if args.wus_unit_m3_per_day is None:
+            notes.append("WUS dimensional comparison skipped because no verified unit was supplied")
+        if flow_name is None:
+            notes.append("No FLOW_IN/FLOW_OUT observation exists at this reach; flow-based WUS ratio was skipped")
         payload["stations"][str(station)] = {
+            "observed_variables": reach_variables[station],
             "route_node_ids": route_ids,
             "source_subbasins": sources,
             "upstream_observed_stations": [
                 row["upstream_station"] for row in dependencies if row["downstream_station"] == station
             ],
             "reservoirs": reservoirs,
+            "flow_observation_used_for_wus_check": flow_name,
             "observed_mean_flow": obs_mean,
+            "max_monthly_wurch_raw_units": river_max_units,
+            "max_monthly_wushal_raw_units": shallow_max_units,
             "max_monthly_wurch_m3s": river_max,
             "max_monthly_wushal_m3s": shallow_max,
             "max_withdrawal_to_mean_flow_ratio": combined_ratio,
             "missing_wus_files": missing_wus,
+            "malformed_wus_files": malformed_wus,
             "issues": issues,
+            "notes": notes,
         }
 
     args.out_dir.mkdir(parents=True, exist_ok=True)

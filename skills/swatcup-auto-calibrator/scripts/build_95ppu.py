@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build process metrics and station-specific 95PPU charts from saved runs."""
+"""Build process metrics and variable-specific 95PPU charts from saved runs."""
 
 from __future__ import annotations
 
@@ -9,15 +9,10 @@ import math
 import re
 from pathlib import Path
 
-try:
-    import numpy as np
-    from PIL import Image, ImageDraw, ImageFont
-except ImportError as exc:
-    raise SystemExit(
-        'build_95ppu.py requires NumPy and Pillow; install with: python -m pip install -e ".[ppu]"'
-    ) from exc
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
-from swatcup_auto_runner import metrics, read_simulated_series
+from swatcup_auto_runner import metrics, read_simulated_indexed_series
 
 
 DATA_RE = re.compile(r"^\s*(\d+)\s+(\S+)\s+([-+0-9.eE]+)\s*$")
@@ -40,7 +35,7 @@ def read_observed(path: Path) -> dict[str, dict[str, list[float] | list[int]]]:
         variable_match = VARIABLE_RE.match(line)
         if variable_match:
             current = variable_match.group(1)
-            result[current] = {"values": [], "months": [], "years": []}
+            result[current] = {"indices": [], "values": [], "months": [], "years": []}
             continue
         data_match = DATA_RE.match(line)
         if current is None or not data_match:
@@ -52,6 +47,7 @@ def read_observed(path: Path) -> dict[str, dict[str, list[float] | list[int]]]:
         else:
             index = int(data_match.group(1)) - 1
             month, year = index % 12 + 1, index // 12
+        result[current]["indices"].append(int(data_match.group(1)))
         result[current]["values"].append(float(data_match.group(3)))
         result[current]["months"].append(month)
         result[current]["years"].append(year)
@@ -71,14 +67,39 @@ def read_series_csv(path: Path) -> dict[str, np.ndarray]:
     return rows
 
 
-def read_final(args: argparse.Namespace, variables: list[str]) -> dict[str, np.ndarray]:
+def validate_series_indices(
+    rows: dict[str, np.ndarray],
+    variable: str,
+    expected: np.ndarray,
+    source: Path,
+) -> None:
+    key = f"{variable}__INDEX"
+    if key not in rows:
+        raise ValueError(f"{source}: missing {key}; regenerate the series with index-preserving extraction")
+    actual = rows[key]
+    if len(actual) != len(expected) or not np.array_equal(actual.astype(int), expected):
+        raise ValueError(f"{source}: {variable} time indices do not match observed_rch.txt")
+
+
+def read_final(
+    args: argparse.Namespace,
+    variables: list[str],
+    expected_indices: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
     if args.final_series_csv:
         rows = read_series_csv(args.final_series_csv)
+        for name in variables:
+            validate_series_indices(rows, name, expected_indices[name], args.final_series_csv)
         return {name: rows[name] for name in variables}
-    return {
-        name: np.asarray(read_simulated_series(args.final_sim_dir / f"{name}.txt"), dtype=float)
-        for name in variables
-    }
+    result: dict[str, np.ndarray] = {}
+    for name in variables:
+        path = args.final_sim_dir / f"{name}.txt"
+        indexed = read_simulated_indexed_series(path)
+        actual_indices = np.asarray([index for index, _value in indexed], dtype=int)
+        if not np.array_equal(actual_indices, expected_indices[name]):
+            raise ValueError(f"{path}: time indices do not match observed_rch.txt")
+        result[name] = np.asarray([value for _index, value in indexed], dtype=float)
+    return result
 
 
 def successful_run_ids(path: Path) -> set[int]:
@@ -98,6 +119,7 @@ def load_ensemble(
     pattern: str,
     variables: list[str],
     expected_lengths: dict[str, int],
+    expected_indices: dict[str, np.ndarray],
     limit: int | None,
     allowed_ids: set[int] | None,
     expected_samples: int | None,
@@ -122,6 +144,7 @@ def load_ensemble(
         if missing_variables:
             raise ValueError(f"run {run_id} is incomplete; missing {missing_variables}")
         for name in variables:
+            validate_series_indices(rows, name, expected_indices[name], path)
             if len(rows[name]) != expected_lengths[name]:
                 raise ValueError(
                     f"run {run_id} {name} length={len(rows[name])}, expected={expected_lengths[name]}"
@@ -139,14 +162,22 @@ def load_ensemble(
     return {name: np.vstack(rows) for name, rows in collected.items()}, run_ids
 
 
-def points(values: np.ndarray, box: tuple[int, int, int, int], ymax: float) -> list[tuple[int, int]]:
+def points(
+    values: np.ndarray,
+    x_values: np.ndarray,
+    box: tuple[int, int, int, int],
+    ymax: float,
+) -> list[tuple[int, int]]:
     left, top, right, bottom = box
     count = len(values)
     if count < 2:
         return [(left, bottom)]
+    xmin = float(np.min(x_values))
+    xmax = float(np.max(x_values))
+    xspan = max(1.0, xmax - xmin)
     return [
         (
-            round(left + i * (right - left) / (count - 1)),
+            round(left + (float(x_values[i]) - xmin) * (right - left) / xspan),
             round(bottom - float(value) / ymax * (bottom - top)),
         )
         for i, value in enumerate(values)
@@ -156,6 +187,7 @@ def points(values: np.ndarray, box: tuple[int, int, int, int], ymax: float) -> l
 def draw_panel(
     draw: ImageDraw.ImageDraw,
     outer: tuple[int, int, int, int],
+    indices: np.ndarray,
     years: np.ndarray,
     obs: np.ndarray,
     final: np.ndarray,
@@ -172,16 +204,18 @@ def draw_panel(
         y = round(plot[3] - fraction * (plot[3] - plot[1]))
         draw.line((plot[0], y, plot[2], y), fill="#dfe5ea", width=1)
         draw.text((left + 3, y - 8), f"{fraction * ymax:.2g}", fill="#5d6973", font=font(11 if compact else 13))
-    low_points = points(low, plot, ymax)
-    high_points = points(high, plot, ymax)
+    low_points = points(low, indices, plot, ymax)
+    high_points = points(high, indices, plot, ymax)
     draw.polygon(high_points + list(reversed(low_points)), fill="#cfe8f6")
-    draw.line(points(median, plot, ymax), fill="#e6952c", width=2)
-    draw.line(points(final, plot, ymax), fill="#2474b5", width=2)
-    draw.line(points(obs, plot, ymax), fill="#111111", width=2)
+    draw.line(points(median, indices, plot, ymax), fill="#e6952c", width=2)
+    draw.line(points(final, indices, plot, ymax), fill="#2474b5", width=2)
+    draw.line(points(obs, indices, plot, ymax), fill="#111111", width=2)
     draw.rectangle(plot, outline="#7d8790", width=1)
     tick_indices = sorted({0, len(years) // 3, 2 * len(years) // 3, len(years) - 1})
+    xmin = float(np.min(indices))
+    xspan = max(1.0, float(np.max(indices)) - xmin)
     for index in tick_indices:
-        x = round(plot[0] + index * (plot[2] - plot[0]) / max(1, len(years) - 1))
+        x = round(plot[0] + (float(indices[index]) - xmin) * (plot[2] - plot[0]) / xspan)
         draw.text((x - 16, plot[3] + 8), str(int(years[index])), fill="#5d6973", font=font(10 if compact else 12))
     draw.text((left + 5, top + 5), title, fill="#18232d", font=font(14 if compact else 18, bold=True))
 
@@ -225,14 +259,19 @@ def main() -> int:
 
     observed = read_observed(args.observed)
     variables = list(observed)
-    final = read_final(args, variables)
     expected_lengths = {name: len(observed[name]["values"]) for name in variables}
+    expected_indices = {
+        name: np.asarray(observed[name]["indices"], dtype=int)
+        for name in variables
+    }
+    final = read_final(args, variables, expected_indices)
     allowed_ids = successful_run_ids(args.results_csv) if args.results_csv else None
     ensemble, ensemble_run_ids = load_ensemble(
         args.ensemble_dir,
         args.glob,
         variables,
         expected_lengths,
+        expected_indices,
         args.max_ensemble,
         allowed_ids,
         args.expected_samples,
@@ -240,9 +279,15 @@ def main() -> int:
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     summaries: list[dict[str, object]] = []
-    panels: list[tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, float], float, float]] = []
+    panels: list[
+        tuple[
+            str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+            np.ndarray, np.ndarray, dict[str, float], float, float,
+        ]
+    ] = []
     for name in variables:
         obs = np.asarray(observed[name]["values"], dtype=float)
+        indices = expected_indices[name]
         months = np.asarray(observed[name]["months"], dtype=int)
         years = np.asarray(observed[name]["years"], dtype=int)
         sim = final[name]
@@ -255,18 +300,43 @@ def main() -> int:
         r_factor = float(np.mean(high - low) / obs_std) if obs_std else math.nan
         row_metrics = metrics(obs.tolist(), sim.tolist(), years=years.tolist(), months=months.tolist())
         station = name.rsplit("_", 1)[-1]
+        is_sediment = name.startswith("SED_")
+        nonzero_mask = obs > 0.0 if is_sediment else np.zeros(len(obs), dtype=bool)
+        nonzero_count = int(np.sum(nonzero_mask))
+        nonzero_p_factor = (
+            float(np.mean((obs[nonzero_mask] >= low[nonzero_mask]) & (obs[nonzero_mask] <= high[nonzero_mask])))
+            if nonzero_count else math.nan
+        )
+        high_event_mask = np.zeros(len(obs), dtype=bool)
+        if nonzero_count:
+            high_event_mask = nonzero_mask & (obs >= np.quantile(obs[nonzero_mask], 0.90))
+        high_event_count = int(np.sum(high_event_mask))
+        high_event_p_factor = (
+            float(
+                np.mean(
+                    (obs[high_event_mask] >= low[high_event_mask])
+                    & (obs[high_event_mask] <= high[high_event_mask])
+                )
+            )
+            if high_event_count else math.nan
+        )
         summary = {
             "variable": name,
             "station": station,
+            "variable_class": "sediment" if is_sediment else "flow" if name.startswith("FLOW_") else "other",
             "ensemble_samples": len(ensemble_run_ids),
             "p_factor": p_factor,
             "r_factor": r_factor,
+            "nonzero_event_count": nonzero_count,
+            "nonzero_event_p_factor": nonzero_p_factor,
+            "high_event_count": high_event_count,
+            "high_event_p_factor": high_event_p_factor,
             "obs_above_95ppu_fraction": float(np.mean(obs > high)),
             "obs_below_95ppu_fraction": float(np.mean(obs < low)),
             **row_metrics,
         }
         summaries.append(summary)
-        panels.append((name, years, obs, sim, low, median, high, row_metrics, p_factor, r_factor))
+        panels.append((name, indices, years, obs, sim, low, median, high, row_metrics, p_factor, r_factor))
 
         image = Image.new("RGB", (1800, 850), "white")
         draw = ImageDraw.Draw(image)
@@ -274,7 +344,9 @@ def main() -> int:
             f"{name} | KGE {row_metrics['kge']:.3f} | NSE {row_metrics['nse']:.3f} | "
             f"P {p_factor:.2f} | R {r_factor:.2f} | n={samples.shape[0]}"
         )
-        draw_panel(draw, (20, 60, 1780, 830), years, obs, sim, low, median, high, title, compact=False)
+        draw_panel(
+            draw, (20, 60, 1780, 830), indices, years, obs, sim, low, median, high, title, compact=False
+        )
         draw.text((30, 15), "Observed / final simulation / small-sample 95PPU", fill="#17202a", font=font(23, bold=True))
         draw_legend(draw, 1060, 34, 14)
         image.save(args.out_dir / f"{name}_95ppu.png")
@@ -283,22 +355,31 @@ def main() -> int:
     rows = math.ceil(len(panels) / columns)
     overview = Image.new("RGB", (columns * 820, 80 + rows * 500), "white")
     draw = ImageDraw.Draw(overview)
-    draw.text((30, 18), "Hydrograph and station-specific 95PPU overview", fill="#17202a", font=font(25, bold=True))
+    draw.text((30, 18), "Process-series and variable-specific 95PPU overview", fill="#17202a", font=font(25, bold=True))
     draw_legend(draw, max(760, columns * 820 - 520), 35, 13)
     for position, panel in enumerate(panels):
-        name, years, obs, sim, low, median, high, row_metrics, p_factor, r_factor = panel
+        name, indices, years, obs, sim, low, median, high, row_metrics, p_factor, r_factor = panel
         row, column = divmod(position, columns)
         x, y = column * 820 + 10, row * 500 + 75
         title = f"{name} | KGE {row_metrics['kge']:.2f} NSE {row_metrics['nse']:.2f} P {p_factor:.2f} R {r_factor:.2f}"
-        draw_panel(draw, (x, y, x + 800, y + 470), years, obs, sim, low, median, high, title, compact=True)
+        draw_panel(
+            draw, (x, y, x + 800, y + 470), indices, years, obs, sim, low, median, high, title, compact=True
+        )
     overview.save(args.out_dir / "all_stations_95ppu_overview.png")
     write_csv(args.out_dir / "process_and_95ppu_metrics.csv", summaries)
 
     for row in summaries:
         warning = " STRUCTURE/RANGE-CHECK" if float(row["p_factor"]) < 0.5 else ""
+        event_text = ""
+        if row["variable_class"] == "sediment":
+            event_text = (
+                f" eventP={float(row['nonzero_event_p_factor']):.3f}"
+                f" highP={float(row['high_event_p_factor']):.3f}"
+            )
         print(
             f"{row['variable']}: KGE={row['kge']:.3f} NSE={row['nse']:.3f} "
-            f"P={row['p_factor']:.3f} R={row['r_factor']:.3f} lag={row['best_lag_months']:+.0f}{warning}"
+            f"P={row['p_factor']:.3f} R={row['r_factor']:.3f} "
+            f"lag={row['best_lag_months']:+.0f}{event_text}{warning}"
         )
     return 0
 

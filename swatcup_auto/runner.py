@@ -23,6 +23,10 @@ SOL_LABELS = {
 }
 RES_ARRAY_LABELS = {"OFLOWMX", "OFLOWMN", "STARG", "WURESN"}
 WUS_ARRAY_LABELS = {"WUPND", "WURCH", "WUSHAL", "WUDEEP"}
+_EXTENSION_FILE_CACHE: dict[tuple[Path, str], list[Path]] = {}
+_TARGET_FILE_CACHE: dict[tuple[Path, str, str], list[Path]] = {}
+_HRU_FIRST_LINE_CACHE: dict[tuple[Path, str], str] = {}
+_CLIP_SUMMARY: dict[str, dict[str, float]] = {}
 FIG_COMMANDS = {
     "subbasin",
     "route",
@@ -123,6 +127,8 @@ def parse_par_inf(path: Path) -> list[tuple[str, float, float]]:
         parts = line.split()
         if len(parts) >= 3 and "__" in parts[0]:
             rows.append((parts[0], float(parts[1]), float(parts[2])))
+            if expected is not None and len(rows) >= expected:
+                break
     if expected is not None and len(rows) != expected:
         raise ValueError(f"{path}: declares {expected} parameters but contains {len(rows)} rows")
     return rows
@@ -171,11 +177,17 @@ def reservoir_file_subbasin(path_or_name: Path | str) -> int | None:
 
 
 def hru_first_line(project: Path, file_path: Path) -> str:
+    cache_key = (project.resolve(), file_path.stem)
+    cached = _HRU_FIRST_LINE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     hru_path = project / f"{file_path.stem}.hru"
     if not hru_path.exists():
         return ""
     with hru_path.open(errors="ignore") as handle:
-        return handle.readline()
+        first_line = handle.readline()
+    _HRU_FIRST_LINE_CACHE[cache_key] = first_line
+    return first_line
 
 
 def selector_matches(project: Path, file_path: Path, selector: str | None) -> bool:
@@ -204,8 +216,18 @@ def target_files(project: Path, param: Parameter) -> list[Path]:
     if param.extension == "bsn":
         return [project / "basins.bsn"]
 
-    files = [path for path in sorted(project.glob(f"*.{param.extension}")) if path.stem.isdigit()]
-    return [path for path in files if selector_matches(project, path, param.selector)]
+    cache_key = (project.resolve(), param.extension, param.selector or "")
+    cached = _TARGET_FILE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    extension_key = (project.resolve(), param.extension)
+    files = _EXTENSION_FILE_CACHE.get(extension_key)
+    if files is None:
+        files = [path for path in sorted(project.glob(f"*.{param.extension}")) if path.stem.isdigit()]
+        _EXTENSION_FILE_CACHE[extension_key] = files
+    matched = [path for path in files if selector_matches(project, path, param.selector)]
+    _TARGET_FILE_CACHE[cache_key] = matched
+    return matched
 
 
 def apply_operation(old_value: float, param: Parameter) -> float:
@@ -217,6 +239,7 @@ def apply_operation(old_value: float, param: Parameter) -> float:
         new_value = old_value + param.value
     else:
         raise ValueError(f"Unsupported operation: {param.operation}")
+    requested_value = new_value
 
     if param.name in {"ADJ_PKR", "PRF_BSN"}:
         new_value = min(2.0, max(0.0, new_value))
@@ -270,20 +293,20 @@ def apply_operation(old_value: float, param: Parameter) -> float:
             new_value = min(12.0, max(1.0, new_value))
         elif param.name == "NDTARGR":
             new_value = min(365.0, new_value)
-    elif param.name in {"EVRSV", "WURTNF", "OFLOWMN_FPS", "STARG_FPS"}:
+    elif param.name in {"EVRSV", "WURTNF"}:
         new_value = min(1.0, max(0.0, new_value))
     elif param.name == "RES_K":
-        new_value = min(10.0, max(0.0, new_value))
+        new_value = max(0.0, new_value)
     elif param.name == "RES_RR":
-        new_value = min(500.0, max(0.0, new_value))
+        new_value = max(0.0, new_value)
     elif param.name in {"RES_VOL", "RES_PVOL", "RES_EVOL", "STARG"}:
-        new_value = min(50000.0, max(0.0, new_value))
+        new_value = max(0.0, new_value)
     elif param.name in {"OFLOWMX", "OFLOWMN"}:
-        new_value = min(1000.0, max(0.0, new_value))
+        new_value = max(0.0, new_value)
     elif param.name == "WURESN":
-        new_value = min(5000.0, max(0.0, new_value))
+        new_value = max(0.0, new_value)
     elif param.name in WUS_ARRAY_LABELS:
-        new_value = min(10000.0, max(0.0, new_value))
+        new_value = max(0.0, new_value)
     elif param.name == "LAT_SED":
         new_value = max(0.0, new_value)
     elif param.name in {"CH_L1", "CH_L2"}:
@@ -300,20 +323,23 @@ def apply_operation(old_value: float, param: Parameter) -> float:
         new_value = min(100.0, max(0.0, new_value))
     elif param.name == "BIOMIX":
         new_value = min(1.0, max(0.0, new_value))
-    elif param.name == "EROS_SPL":
-        new_value = min(3.1, max(0.9, new_value))
-    elif param.name == "RILL_MULT":
-        new_value = min(2.0, max(0.5, new_value))
-    elif param.name == "EROS_EXPO":
-        new_value = min(3.0, max(0.9, new_value))
-    elif param.name == "SUBD_CHSED":
-        new_value = min(2.0, max(0.0, round(new_value)))
-    elif param.name == "C_FACTOR":
-        new_value = min(0.45, max(0.001, new_value))
-    elif param.name == "CH_D50":
-        new_value = min(100.0, max(10.0, new_value))
-    elif param.name == "SIG_G":
-        new_value = min(5.0, max(1.0, new_value))
+
+    if not math.isclose(requested_value, new_value, rel_tol=0.0, abs_tol=1e-12):
+        row = _CLIP_SUMMARY.setdefault(
+            param.raw_name,
+            {
+                "count": 0.0,
+                "requested_min": requested_value,
+                "requested_max": requested_value,
+                "applied_min": new_value,
+                "applied_max": new_value,
+            },
+        )
+        row["count"] += 1.0
+        row["requested_min"] = min(row["requested_min"], requested_value)
+        row["requested_max"] = max(row["requested_max"], requested_value)
+        row["applied_min"] = min(row["applied_min"], new_value)
+        row["applied_max"] = max(row["applied_max"], new_value)
 
     return new_value
 
@@ -521,6 +547,8 @@ def parse_fig(path: Path) -> dict[int, FigNode]:
             # These are commands, not hydrograph-routing nodes. Transfers are
             # parsed separately by audit_structure.py as source/destination couplings.
             node = None
+        elif op == "saveconc" and len(ints) >= 2:
+            node = FigNode(op, ints[1], ints[2] if len(ints) >= 3 else None, (), files)
 
         if node is not None:
             nodes[node.node_id] = node
@@ -614,7 +642,7 @@ def station_ids_from_observed(project: Path, observed_path: Path | None = None) 
     observed = read_observed_blocks(observed_path or project / "SUFI2.IN" / "observed_rch.txt")
     station_ids: list[int] = []
     for name in observed:
-        match = re.fullmatch(r"FLOW_OUT_(\d+)", name)
+        match = re.fullmatch(r"FLOW_(?:IN|OUT)_(\d+)", name)
         if match:
             station_ids.append(int(match.group(1)))
     return sorted(set(station_ids))
@@ -715,6 +743,7 @@ def conservative_res_parameter_rows(project: Path, scopes: list[ReservoirScope])
 
 
 def apply_parameters(project: Path, params: list[Parameter]) -> dict[str, int]:
+    _CLIP_SUMMARY.clear()
     backup = project / "DirectBase"
     if not backup.exists():
         backup = project / "Backup"
@@ -760,7 +789,26 @@ def apply_parameters(project: Path, params: list[Parameter]) -> dict[str, int]:
         "\n".join(f"{name}\t{count}" for name, count in counts.items()) + "\n",
         encoding="utf-8",
     )
+    with (project / "direct_clip_log.csv").open("w", newline="", encoding="utf-8-sig") as handle:
+        fieldnames = ["parameter", "count", "requested_min", "requested_max", "applied_min", "applied_max"]
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for name, row in sorted(_CLIP_SUMMARY.items()):
+            writer.writerow({"parameter": name, **row})
     return counts
+
+
+def current_clip_receipt() -> tuple[int, int, str]:
+    total = int(sum(row["count"] for row in _CLIP_SUMMARY.values()))
+    details = " | ".join(
+        (
+            f"{name}[n={int(row['count'])};"
+            f"requested={row['requested_min']:.12g}..{row['requested_max']:.12g};"
+            f"applied={row['applied_min']:.12g}..{row['applied_max']:.12g}]"
+        )
+        for name, row in sorted(_CLIP_SUMMARY.items())
+    )
+    return total, len(_CLIP_SUMMARY), details
 
 
 def clear_sufi2_out(project: Path) -> None:
@@ -807,19 +855,43 @@ def run_program(project: Path, exe: str, log_name: str) -> None:
 def run_model(project: Path) -> None:
     clear_sufi2_out(project)
     clear_swat_outputs(project)
+    output_rch = project / "output.rch"
+    previous_signature = None
+    if output_rch.exists():
+        stat = output_rch.stat()
+        previous_signature = (stat.st_mtime_ns, stat.st_size)
     run_program(project, "swat.exe", "direct_swat.log")
+    current_signature = None
+    if output_rch.exists():
+        stat = output_rch.stat()
+        current_signature = (stat.st_mtime_ns, stat.st_size)
+    if current_signature is None or current_signature == previous_signature:
+        # Some custom SWAT builds perform a one-time initialization and exit 0
+        # without producing a new output.rch. Retry once in the same directory;
+        # otherwise a stale copied output can be mistaken for a valid simulation.
+        run_program(project, "swat.exe", "direct_swat_retry.log")
+        if not output_rch.exists():
+            raise RuntimeError("swat.exe did not create output.rch after initialization retry")
+        stat = output_rch.stat()
+        retry_signature = (stat.st_mtime_ns, stat.st_size)
+        if retry_signature == previous_signature:
+            raise RuntimeError("swat.exe exited successfully but output.rch stayed stale after retry")
     run_program(project, "SUFI2_extract_rch.exe", "direct_extract.log")
 
 
-def read_simulated_series(path: Path) -> list[float]:
-    values: list[float] = []
+def read_simulated_indexed_series(path: Path) -> list[tuple[int, float]]:
+    values: list[tuple[int, float]] = []
     for line in path.read_text(errors="ignore").splitlines():
         parts = line.split()
         if len(parts) == 1:
             continue
         if len(parts) >= 2 and parts[0].isdigit():
-            values.append(float(parts[1]))
+            values.append((int(parts[0]), float(parts[1])))
     return values
+
+
+def read_simulated_series(path: Path) -> list[float]:
+    return [value for _index, value in read_simulated_indexed_series(path)]
 
 
 def read_observed_blocks(path: Path) -> dict[str, list[tuple[int, float]]]:
@@ -854,7 +926,7 @@ def read_observed_blocks(path: Path) -> dict[str, list[tuple[int, float]]]:
 PROCESS_METRIC_KEYS = (
     "r2", "nse", "kge", "pbias", "r", "log_nse", "clim_r",
     "best_lag_months", "best_lag_r", "peak_offset_months",
-    "peak_capture", "lowflow_ratio", "sim_zero_fraction",
+    "peak_capture", "lowflow_ratio", "sim_zero_fraction", "sim_negative_count",
 )
 
 
@@ -911,15 +983,20 @@ def metrics(
         for month in climatology_months
     ]
 
+    time_keys = [year * 12 + month for year, month in zip(years, months)]
+    sim_by_time = {time_key: sim[index] for index, time_key in enumerate(time_keys)}
     best_lag = 0
     best_lag_r = -2.0
     for lag in range(-3, 4):
-        if lag > 0:
-            lag_r = _corr(obs[:-lag], sim[lag:])
-        elif lag < 0:
-            lag_r = _corr(obs[-lag:], sim[:lag])
-        else:
-            lag_r = r
+        lagged_pairs = [
+            (obs[index], sim_by_time[time_key + lag])
+            for index, time_key in enumerate(time_keys)
+            if time_key + lag in sim_by_time
+        ]
+        lag_r = _corr(
+            [pair[0] for pair in lagged_pairs],
+            [pair[1] for pair in lagged_pairs],
+        )
         if math.isfinite(lag_r) and (
             lag_r > best_lag_r + 1e-12
             or (abs(lag_r - best_lag_r) <= 1e-12 and abs(lag) < abs(best_lag))
@@ -961,6 +1038,7 @@ def metrics(
         "peak_capture": peak_capture,
         "lowflow_ratio": lowflow_ratio,
         "sim_zero_fraction": sum(1 for x in sim if x <= 1e-10) / n,
+        "sim_negative_count": float(sum(1 for x in sim if x < 0.0)),
     }
 
 
@@ -968,11 +1046,25 @@ def evaluate_outputs(project: Path, observed_path: Path | None = None) -> dict[s
     observed = read_observed_blocks(observed_path or project / "SUFI2.IN" / "observed_rch.txt")
     result: dict[str, dict[str, float]] = {}
     for name, pairs in observed.items():
-        sim_all = read_simulated_series(project / "SUFI2.OUT" / f"{name}.txt")
+        sim_pairs = read_simulated_indexed_series(project / "SUFI2.OUT" / f"{name}.txt")
+        obs_indices = [index for index, _obs_value in pairs]
+        sim_indices = [index for index, _sim_value in sim_pairs]
         obs_values = [obs_value for _, obs_value in pairs]
-        sim_values = sim_all
+        sim_values = [sim_value for _, sim_value in sim_pairs]
         if len(obs_values) != len(sim_values):
             raise ValueError(f"{name}: series length mismatch obs={len(obs_values)} sim={len(sim_values)}")
+        if obs_indices != sim_indices:
+            mismatch = next(
+                (
+                    position for position, (obs_index, sim_index) in enumerate(zip(obs_indices, sim_indices), start=1)
+                    if obs_index != sim_index
+                ),
+                None,
+            )
+            raise ValueError(
+                f"{name}: extracted time indices differ from observations"
+                + (f" at row {mismatch}" if mismatch is not None else "")
+            )
         years: list[int] = []
         months: list[int] = []
         for index, _obs_value in pairs:
@@ -998,6 +1090,60 @@ def parse_variable_weights(value: str | None, variable_names: list[str]) -> dict
     return weights
 
 
+def apply_class_weights(
+    value: str | None,
+    variable_names: list[str],
+    variable_weights: dict[str, float],
+) -> dict[str, float]:
+    if not value:
+        return variable_weights
+    present_classes = {observation_class(name) for name in variable_names}
+    class_weights: dict[str, float] = {}
+    for item in value.split(","):
+        raw_class, separator, raw_weight = item.strip().partition("=")
+        class_name = raw_class.upper()
+        if not separator or class_name not in present_classes:
+            raise ValueError(f"Invalid --class-weights item: {item!r}")
+        weight = float(raw_weight)
+        if not math.isfinite(weight) or weight <= 0.0:
+            raise ValueError(f"Class weight for {class_name} must be finite and positive")
+        class_weights[class_name] = weight
+    missing = sorted(present_classes - set(class_weights))
+    if missing:
+        raise ValueError(f"--class-weights must specify every observed class; missing {missing}")
+    class_totals = {
+        class_name: sum(
+            variable_weights[name]
+            for name in variable_names
+            if observation_class(name) == class_name
+        )
+        for class_name in present_classes
+    }
+    return {
+        name: variable_weights[name]
+        * class_weights[observation_class(name)]
+        / class_totals[observation_class(name)]
+        for name in variable_names
+    }
+
+
+def parse_class_floors(value: str | None) -> dict[tuple[str, str], float]:
+    floors: dict[tuple[str, str], float] = {}
+    if not value:
+        return floors
+    for item in value.split(","):
+        left, separator, raw_floor = item.strip().partition("=")
+        class_name, class_separator, metric_name = left.partition(":")
+        key = (class_name.upper(), metric_name.lower())
+        if not separator or not class_separator or key[0] not in {"FLOW", "SEDIMENT", "OTHER"} or key[1] not in {"kge", "nse"}:
+            raise ValueError(f"Invalid --class-floors item: {item!r}")
+        floor = float(raw_floor)
+        if not math.isfinite(floor):
+            raise ValueError(f"Class floor for {key[0]}:{key[1].upper()} must be finite")
+        floors[key] = floor
+    return floors
+
+
 def combined_score(
     result: dict[str, dict[str, float]],
     variable_weights: dict[str, float] | None = None,
@@ -1006,6 +1152,33 @@ def combined_score(
     weights = variable_weights or {name: 1.0 for name in result}
     total_weight = sum(weights[name] for name in result)
     return sum(result[name]["kge"] * weights[name] for name in result) / total_weight
+
+
+def observation_class(name: str) -> str:
+    if name.startswith("FLOW_"):
+        return "FLOW"
+    if name.startswith("SED_"):
+        return "SEDIMENT"
+    return "OTHER"
+
+
+def print_group_summary(
+    variable_names: list[str],
+    variable_weights: dict[str, float],
+    metric_value,
+) -> None:
+    groups: dict[str, list[str]] = {}
+    for name in variable_names:
+        groups.setdefault(observation_class(name), []).append(name)
+    groups["GLOBAL"] = variable_names
+    for group, names in groups.items():
+        total_weight = sum(variable_weights[name] for name in names)
+        mean_kge = sum(metric_value(name, "kge") * variable_weights[name] for name in names) / total_weight
+        print(
+            f"{group} summary: variables={len(names)} weighted_mean_KGE={mean_kge:.4f} "
+            f"worst_KGE={min(metric_value(name, 'kge') for name in names):.4f} "
+            f"worst_NSE={min(metric_value(name, 'nse') for name in names):.4f}"
+        )
 
 
 def multisite_timeseries_score(
@@ -1053,7 +1226,9 @@ def print_result(result: dict[str, dict[str, float]]) -> None:
             f"{name}: R2={row['r2']:.4f} NSE={row['nse']:.4f} "
             f"KGE={row['kge']:.4f} PBIAS={row['pbias']:.2f}"
         )
-    print(f"Equal-weight mean KGE={combined_score(result):.4f}")
+    variable_names = list(result)
+    weights = {name: 1.0 for name in variable_names}
+    print_group_summary(variable_names, weights, lambda name, metric: result[name][metric])
 
 
 def command_single(args: argparse.Namespace) -> None:
@@ -1120,6 +1295,9 @@ def flatten_result(
     elapsed: float,
     status: str,
     error: str,
+    clip_count: int,
+    clipped_parameter_count: int,
+    clip_details: str,
 ) -> dict[str, float | int | str]:
     row: dict[str, float | int | str] = {
         "run": run_id,
@@ -1127,6 +1305,9 @@ def flatten_result(
         "error": error,
         "score": score,
         "elapsed_seconds": elapsed,
+        "clip_count": clip_count,
+        "clipped_parameter_count": clipped_parameter_count,
+        "clip_details": clip_details,
     }
     for i, value in enumerate(values, start=1):
         row[f"par_{i}"] = value
@@ -1179,26 +1360,35 @@ def run_sample_batch(
         started = time.time()
         status = "ok"
         error = ""
+        clip_count = 0
+        clipped_parameter_count = 0
+        clip_details = ""
         try:
             apply_parameters(project, params)
+            clip_count, clipped_parameter_count, clip_details = current_clip_receipt()
             run_model(project)
             result = evaluate_outputs(project, observed_path)
             score = score_result(result, score_mode, variable_weights)
             if series_dir is not None:
                 series_dir.mkdir(parents=True, exist_ok=True)
-                series_rows: list[tuple[str, list[float]]] = []
+                series_rows: list[tuple[str, list[int], list[float]]] = []
                 for variable in variable_names:
-                    series_rows.append((variable, read_simulated_series(project / "SUFI2.OUT" / f"{variable}.txt")))
-                series_length = max((len(values) for _, values in series_rows), default=0)
+                    indexed = read_simulated_indexed_series(project / "SUFI2.OUT" / f"{variable}.txt")
+                    series_rows.append(
+                        (variable, [index for index, _value in indexed], [value for _index, value in indexed])
+                    )
+                series_length = max((len(values) for _variable, _indices, values in series_rows), default=0)
                 series_path = series_dir / f"run_{run_id:04d}_series.csv"
                 temporary_path = series_path.with_suffix(series_path.suffix + ".tmp")
                 with temporary_path.open("w", newline="", encoding="utf-8") as series_handle:
                     series_writer = csv.writer(series_handle)
                     series_writer.writerow(["variable", *[f"t{i}" for i in range(1, series_length + 1)]])
-                    for variable, values_row in series_rows:
+                    for variable, indices_row, values_row in series_rows:
+                        series_writer.writerow([f"{variable}__INDEX", *indices_row])
                         series_writer.writerow([variable, *values_row])
                 temporary_path.replace(series_path)
         except Exception as exc:
+            clip_count, clipped_parameter_count, clip_details = current_clip_receipt()
             result = {
                 variable: {key: float("nan") for key in PROCESS_METRIC_KEYS}
                 for variable in variable_names
@@ -1209,14 +1399,28 @@ def run_sample_batch(
             with (project / "direct_failed_runs.log").open("a", encoding="utf-8") as handle:
                 handle.write(f"run={run_id}\t{error}\n")
         elapsed = time.time() - started
-        rows.append(flatten_result(run_id, score, values, result, variable_names, elapsed, status, error))
+        rows.append(
+            flatten_result(
+                run_id,
+                score,
+                values,
+                result,
+                variable_names,
+                elapsed,
+                status,
+                error,
+                clip_count,
+                clipped_parameter_count,
+                clip_details,
+            )
+        )
         write_rows_csv(project / "direct_partial_results.csv", rows, names, variable_names)
         if progress:
             valid_kge = [row["kge"] for row in result.values() if math.isfinite(row["kge"])]
             mean_kge = sum(valid_kge) / len(valid_kge) if valid_kge else float("nan")
             print(
                 f"run {offset}/{len(run_ids)} (global {run_id}): score={score:.4f} "
-                f"mean_KGE={mean_kge:.4f} elapsed={elapsed:.1f}s",
+                f"mean_KGE={mean_kge:.4f} clips={clip_count} elapsed={elapsed:.1f}s",
                 flush=True,
             )
     return rows
@@ -1233,6 +1437,8 @@ def copy_worker_project(source_project: Path, worker_root: Path, worker_index: i
             "SUFI2.OUT",
             "direct_*.log",
             "direct_edit_log.txt",
+            "direct_clip_log.csv",
+            "direct_partial_results.csv",
             "output.*",
             "swat_output.txt",
             "Iterations",
@@ -1260,7 +1466,10 @@ def write_rows_csv(
 ) -> None:
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     with out_csv.open("w", newline="", encoding="utf-8") as handle:
-        fieldnames = ["run", "status", "error", "score", "elapsed_seconds"] + [f"par_{i + 1}" for i in range(len(names))]
+        fieldnames = [
+            "run", "status", "error", "score", "elapsed_seconds",
+            "clip_count", "clipped_parameter_count", "clip_details",
+        ] + [f"par_{i + 1}" for i in range(len(names))]
         fieldnames.extend(metric_fieldnames(variable_names))
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -1273,11 +1482,22 @@ def select_best_row(
     variable_weights: dict[str, float],
     min_station_nse: float | None,
     min_station_kge: float | None,
+    class_floors: dict[tuple[str, str], float],
+    allow_clipped_runs: bool,
 ) -> tuple[dict[str, float | int | str], int]:
-    successful = [row for row in rows if row.get("status") == "ok"]
-    if not successful:
+    all_successful = [row for row in rows if row.get("status") == "ok"]
+    if not all_successful:
         raise RuntimeError(f"All {len(rows)} sample attempts failed")
-    if min_station_nse is None and min_station_kge is None:
+    successful = [
+        row for row in all_successful
+        if allow_clipped_runs or int(float(row.get("clip_count", 0))) == 0
+    ]
+    if not successful:
+        raise RuntimeError(
+            "Every successful run used safety clipping; review per-run clip_details and active parameter semantics, "
+            "then change the ranges or explicitly use --allow-clipped-runs"
+        )
+    if min_station_nse is None and min_station_kge is None and not class_floors:
         return max(successful, key=lambda row: float(row["score"])), len(successful)
 
     feasible = [
@@ -1285,11 +1505,16 @@ def select_best_row(
         if all(
             (min_station_nse is None or float(row[f"{variable}_nse"]) >= min_station_nse)
             and (min_station_kge is None or float(row[f"{variable}_kge"]) >= min_station_kge)
+            and all(
+                float(row[f"{variable}_{metric}"]) >= floor
+                for (class_name, metric), floor in class_floors.items()
+                if observation_class(variable) == class_name
+            )
             for variable in variable_names
         )
     ]
     if not feasible:
-        raise RuntimeError("No successful run met every station threshold; no best_model.in was exported")
+        raise RuntimeError("No successful run met every variable/class threshold; no best_model.in was exported")
 
     def hierarchy(row: dict[str, float | int | str]) -> tuple[float, float, float, float]:
         kge_values = [float(row[f"{variable}_kge"]) for variable in variable_names]
@@ -1317,10 +1542,24 @@ def command_sample(args: argparse.Namespace) -> None:
     observed_for_names = observed_path or project / "SUFI2.IN" / "observed_rch.txt"
     variable_names = list(read_observed_blocks(observed_for_names).keys())
     variable_weights = parse_variable_weights(args.variable_weights, variable_names)
+    variable_weights = apply_class_weights(args.class_weights, variable_names, variable_weights)
+    class_floors = parse_class_floors(args.class_floors)
+    absent_floor_classes = sorted(
+        {class_name for class_name, _metric in class_floors}
+        - {observation_class(name) for name in variable_names}
+    )
+    if absent_floor_classes:
+        raise ValueError(f"--class-floors references absent observation classes: {absent_floor_classes}")
     print(
         "Variable weights: "
         + ", ".join(f"{name}={variable_weights[name]:g}" for name in variable_names)
     )
+    if args.score_mode == "multisite_timeseries":
+        print(
+            "Heuristic score components: KGE=.35 NSE=.23 r=.12 logNSE=.12 monthly_climatology=.10; "
+            "lag/peak-offset/peak-capture/zero penalties=.025 each; worst-variable bonus=.12; "
+            "negative-NSE penalty=.30. This is a search heuristic, not an acceptance threshold."
+        )
     out_csv = Path(args.out_csv).resolve()
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     series_dir = Path(args.series_dir).resolve() if args.series_dir else None
@@ -1349,12 +1588,7 @@ def command_sample(args: argparse.Namespace) -> None:
             progress=True,
         )
     else:
-        if args.workers_dir:
-            worker_root = Path(args.workers_dir).resolve()
-        else:
-            worker_root = out_csv.parent / f"{out_csv.stem}_workers"
-            if worker_root == project or project in worker_root.parents:
-                worker_root = project.parent / f"{project.name}_{out_csv.stem}_workers"
+        worker_root = Path(args.workers_dir).resolve() if args.workers_dir else out_csv.with_suffix("").parent / f"{out_csv.stem}_workers"
         worker_root.mkdir(parents=True, exist_ok=True)
         futures = []
         rows = []
@@ -1411,9 +1645,13 @@ def command_sample(args: argparse.Namespace) -> None:
         write_rows_csv(out_csv, rows, names, variable_names)
 
     failed_count = len(rows) - successful_count
+    clipped_success_count = sum(
+        row.get("status") == "ok" and int(float(row.get("clip_count", 0))) > 0
+        for row in rows
+    )
     print(
         f"Sampling summary: attempted={len(rows)} succeeded={successful_count} "
-        f"failed={failed_count} target={args.runs}",
+        f"failed={failed_count} clipped_successful={clipped_success_count} target={args.runs}",
         flush=True,
     )
     if args.cleanup_workers and worker_root is not None:
@@ -1427,9 +1665,15 @@ def command_sample(args: argparse.Namespace) -> None:
         )
 
     best_row, feasible_count = select_best_row(
-        rows, variable_names, variable_weights, args.min_station_nse, args.min_station_kge
+        rows,
+        variable_names,
+        variable_weights,
+        args.min_station_nse,
+        args.min_station_kge,
+        class_floors,
+        args.allow_clipped_runs,
     )
-    if args.min_station_nse is not None or args.min_station_kge is not None:
+    if args.min_station_nse is not None or args.min_station_kge is not None or class_floors:
         print(f"Threshold-feasible runs={feasible_count}/{successful_count} successful")
         mean_kge = sum(
             float(best_row[f"{name}_kge"]) * variable_weights[name] for name in variable_names
@@ -1439,6 +1683,11 @@ def command_sample(args: argparse.Namespace) -> None:
             f"weighted mean KGE={mean_kge:.4f}"
         )
     print(f"Best run={best_row['run']} score={float(best_row['score']):.4f}")
+    if int(float(best_row.get("clip_count", 0))) > 0:
+        print(
+            "WARNING: selected run contains explicitly allowed safety clipping; "
+            f"clip_count={best_row['clip_count']} details={best_row['clip_details']}"
+        )
     for variable in variable_names:
         print(
             f"{variable}: R2={float(best_row[f'{variable}_r2']):.4f} "
@@ -1446,6 +1695,11 @@ def command_sample(args: argparse.Namespace) -> None:
             f"KGE={float(best_row[f'{variable}_kge']):.4f} "
             f"PBIAS={float(best_row[f'{variable}_pbias']):.2f}"
         )
+    print_group_summary(
+        variable_names,
+        variable_weights,
+        lambda name, metric: float(best_row[f"{name}_{metric}"]),
+    )
     write_best_model(best_path, names, best_row)
     print(f"Best model.in: {best_path}")
 
@@ -1533,7 +1787,7 @@ def command_reservoir_scope(args: argparse.Namespace) -> None:
     observed_path = Path(args.observed_rch).resolve() if args.observed_rch else None
     station_ids = parse_station_arg(args.stations) or station_ids_from_observed(project, observed_path)
     if not station_ids:
-        raise ValueError("No station ids supplied and no FLOW_OUT_* blocks found in observed_rch.txt")
+        raise ValueError("No station ids supplied and no FLOW_IN/FLOW_OUT blocks found in observed_rch.txt")
 
     fig_path = Path(args.fig).resolve() if args.fig else project / "fig.fig"
     scopes = reservoir_scope(project, station_ids, fig_path)
@@ -1548,10 +1802,10 @@ def command_reservoir_scope(args: argparse.Namespace) -> None:
     else:
         print("No local or upstream reservoirs found for requested stations.")
 
-    rows = conservative_res_parameter_rows(project, scopes)
+    rows = conservative_res_parameter_rows(project, scopes) if args.allow_heuristic_ranges else []
     if args.out_par_inf:
-        if args.runs is None or args.runs < 1:
-            raise ValueError("--runs must be positive when --out-par-inf is used")
+        if not args.allow_heuristic_ranges:
+            raise ValueError("--out-par-inf requires explicit --allow-heuristic-ranges")
         out_path = Path(args.out_par_inf).resolve()
         out_path.parent.mkdir(parents=True, exist_ok=True)
         lines = [
@@ -1602,20 +1856,39 @@ def build_parser() -> argparse.ArgumentParser:
         "--variable-weights",
         help="Optional comma-separated observation-block weights, for example NAME_A=2,NAME_B=1.",
     )
+    sample.add_argument(
+        "--class-weights",
+        help=(
+            "Optional total weights by observed class, for example FLOW=1,SEDIMENT=1. "
+            "Every present class must be supplied; --variable-weights remain relative within each class."
+        ),
+    )
+    sample.add_argument(
+        "--class-floors",
+        help="Optional class guardrails using FLOW:KGE=value,FLOW:NSE=value syntax.",
+    )
+    sample.add_argument(
+        "--allow-clipped-runs",
+        action="store_true",
+        help=(
+            "Allow a clipped run to be selected only after verifying the active executable/profile; "
+            "per-run requested/applied extrema remain in the result CSV."
+        ),
+    )
     sample.add_argument("--out-csv", required=True)
     sample.add_argument("--observed-rch")
     sample.add_argument("--workers", type=int, default=1)
     sample.add_argument("--workers-dir")
     sample.add_argument("--refresh-workers", action="store_true")
     sample.add_argument("--cleanup-workers", action="store_true")
-    sample.add_argument("--series-dir", help="Optional directory for per-run hydrographs used to build 95PPU.")
+    sample.add_argument("--series-dir", help="Optional directory for per-run process series used to build 95PPU.")
     sample.add_argument(
         "--max-attempts",
         type=int,
         help="Maximum attempts used to obtain --runs successful simulations (default: same as --runs).",
     )
-    sample.add_argument("--min-station-nse", type=float, help="Require every station to meet this NSE.")
-    sample.add_argument("--min-station-kge", type=float, help="Require every station to meet this KGE.")
+    sample.add_argument("--min-station-nse", type=float, help="Require every observed variable to meet this NSE.")
+    sample.add_argument("--min-station-kge", type=float, help="Require every observed variable to meet this KGE.")
     sample.set_defaults(func=command_sample)
 
     plan = sub.add_parser("plan")
@@ -1633,11 +1906,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     reservoir_parser = sub.add_parser("reservoir-scope")
     reservoir_parser.add_argument("--project", required=True)
-    reservoir_parser.add_argument("--stations", help="Comma/range station ids. Defaults to FLOW_OUT_* blocks in observed_rch.txt.")
+    reservoir_parser.add_argument(
+        "--stations",
+        help="Comma/range station ids. Defaults to FLOW_IN/FLOW_OUT blocks in observed_rch.txt.",
+    )
     reservoir_parser.add_argument("--observed-rch")
     reservoir_parser.add_argument("--fig")
     reservoir_parser.add_argument("--out-par-inf")
-    reservoir_parser.add_argument("--runs", type=int, help="Simulation count written to --out-par-inf.")
+    reservoir_parser.add_argument(
+        "--allow-heuristic-ranges",
+        action="store_true",
+        help="Explicitly allow generic screening ranges; verify them against current facility data before use.",
+    )
+    reservoir_parser.add_argument("--runs", type=int, required=True)
     reservoir_parser.set_defaults(func=command_reservoir_scope)
     return parser
 

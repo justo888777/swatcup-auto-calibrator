@@ -1,4 +1,4 @@
 interface:
   display_name: "SWAT-CUP Auto Calibrator"
-  short_description: "Diagnose and automate multi-site SWAT-CUP calibration"
-  default_prompt: "Use $swatcup-auto-calibrator to derive topology and run settings from this project, calibrate and diagnose it, then prepare a native GUI-runnable SWAT-CUP project."
+  short_description: "Adaptive multi-site SWAT-CUP calibration and GUI delivery"
+  default_prompt: "Use $swatcup-auto-calibrator to derive this project's topology, observations, units, constraints, and run settings; calibrate in evidence-driven batches with process checks; then prepare and natively validate a GUI-runnable SWAT-CUP project."

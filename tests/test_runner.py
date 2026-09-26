@@ -5,11 +5,14 @@ from pathlib import Path
 from swatcup_auto.runner import (
     INTEGER_PIPE_PARAMETERS,
     ReservoirScope,
+    apply_class_weights,
+    clear_sufi2_out,
     clear_swat_outputs,
     conservative_res_parameter_rows,
     copy_worker_project,
     parse_par_inf,
     reservoir_scope,
+    select_best_row,
 )
 
 
@@ -37,6 +40,21 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "declares 2 parameters"):
             parse_par_inf(path)
 
+    def test_par_inf_ignores_inactive_examples_after_declared_rows(self) -> None:
+        path = self.directory / "par_inf.txt"
+        path.write_text(
+            "2 : Number of Parameters\n8 : number of simulations\n\n"
+            "r__CN2.mgt -0.2 0.2\n"
+            "v__ALPHA_BF.gw 0.0 1.0\n"
+            "-----------------\n"
+            "v__GW_DELAY.gw 30.0 450.0\n",
+            encoding="utf-8",
+        )
+
+        rows = parse_par_inf(path)
+
+        self.assertEqual([row[0] for row in rows], ["r__CN2.mgt", "v__ALPHA_BF.gw"])
+
     def test_integer_parameter_compatibility_is_preserved(self) -> None:
         self.assertTrue(
             {"CH_EQN", "SUBD_CHSED", "ICFAC", "ICN", "IRESCO", "IFLOD1R", "IFLOD2R", "NDTARGR"}
@@ -63,6 +81,36 @@ class RunnerTests(unittest.TestCase):
 
         self.assertTrue(control.exists())
         self.assertFalse(any((self.directory / name).exists() for name in removable))
+
+    def test_extracted_series_are_cleared_before_each_run(self) -> None:
+        out_dir = self.directory / "SUFI2.OUT"
+        out_dir.mkdir()
+        (out_dir / "FLOW_OUT_1.txt").write_text("old", encoding="utf-8")
+
+        clear_sufi2_out(self.directory)
+
+        self.assertEqual(list(out_dir.iterdir()), [])
+
+    def test_class_weights_preserve_within_class_ratios(self) -> None:
+        names = ["FLOW_OUT_1", "FLOW_OUT_2", "SED_OUT_1"]
+        weights = {"FLOW_OUT_1": 1.0, "FLOW_OUT_2": 3.0, "SED_OUT_1": 1.0}
+
+        weighted = apply_class_weights("FLOW=0.4,SEDIMENT=0.6", names, weights)
+
+        self.assertAlmostEqual(weighted["FLOW_OUT_1"], 0.1)
+        self.assertAlmostEqual(weighted["FLOW_OUT_2"], 0.3)
+        self.assertAlmostEqual(weighted["SED_OUT_1"], 0.6)
+
+    def test_clipped_run_is_not_selected_by_default(self) -> None:
+        rows = [
+            {"run": 1, "status": "ok", "score": 0.9, "clip_count": 1},
+            {"run": 2, "status": "ok", "score": 0.7, "clip_count": 0},
+        ]
+
+        selected, feasible_count = select_best_row(rows, [], {}, None, None, {}, False)
+
+        self.assertEqual(selected["run"], 2)
+        self.assertEqual(feasible_count, 1)
 
     def test_reservoir_ranges_keep_months_and_editor_limits(self) -> None:
         project = self.directory

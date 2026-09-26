@@ -6,22 +6,21 @@
 
 它可以直接复现 `model.in`，在相互隔离的工程副本中进行参数采样，计算各站点 R2、NSE、KGE、PBIAS 及水文过程指标，并准备能够继续使用 SWAT-CUP GUI 和原生 BAT 文件运行的正式工程。
 
-## 1.1.1 版本更新
+## 1.4.0 版本更新
 
-1.1.1 会在每次模拟前清理 SWAT 根目录的运行输出，修复复用 worker 时后续样本与干净工程重放不一致的问题；该问题即使参数输入和 `DirectBase/` 完全一致也可能出现。
-
-1.1 系列将原有的无 GUI 运行器扩展为完整的率定、诊断和 GUI 工程交付工作流：
+1.4.0 将运行器扩展为自适应、多约束率定和原生 GUI 工程交付工作流：
 
 - 新增多站点过程诊断，包括相关系数、log-NSE、月尺度气候态、最佳时滞、洪峰偏移、洪峰捕获率、低流量比例和模拟零流量比例。
-- 保存每次模拟的完整过程线，并基于有效样本构建逐站点 95PPU 包络。
-- 根据当前工程的 `fig.fig` 审计站点上下游关系、记录输入、WUS 用水以及本地或上游水库。
-- 支持 `.wus` 和 `.res` 联合调参，并对水库参数施加温和的物理约束。
-- 水库目标库容、最小/最大出流和取水量均按月份调整，不会将原有季节过程压成全年固定值。
-- 支持不同站点权重以及逐站点 NSE/KGE 准入阈值。
-- 记录失败模拟并按最大尝试次数补充采样，使要求的样本数代表成功完成的模拟数。
-- 新增固定输入同步、原生 GUI 工程检查和 BAT 冒烟测试验证。
+- 支持自适应分批搜索，并从中断任务中恢复已完整完成的结果。
+- 支持径流/泥沙类别权重、变量权重、准入阈值，以及局部最优拼接后的整模复现。
+- 保存每次模拟的过程线，并按照原始观测索引构建逐站点 95PPU 包络。
+- 根据当前工程的 `fig.fig` 审计站点依赖、记录输入、WUS、调水、水库及提取位置。
+- 支持 `.wus` 和 `.res` 温和联合调参，保留月际季节结构和物理约束。
+- 记录参数裁剪明细，避免请求值与实际应用值静默偏离。
+- 原生 GUI 检查覆盖矩阵维度、CRLF 控制文件、真实编辑记录、尾部参数截断和正式 `SUFI2.OUT/` 清理。
+- 增加旧版提取器重复追加输出序列的状态检查。
 
-1.1.0 移除了针对特定流域编写的 `sediment` 和 `hhb_flow` 评分模式。普通率定可使用带站点权重的 `kge`，需要兼顾过程形态时使用 `multisite_timeseries`。
+不再支持针对单一流域编写的评分模式。普通率定可使用等权或显式变量权重的 `kge`，月尺度过程搜索可使用 `multisite_timeseries`。
 
 ## 安全原则
 
@@ -30,13 +29,14 @@ SWAT 和 SUFI2 会写入固定文件名，因此不能在同一个工程目录�
 必须遵守以下原则：
 
 - 保留用户原始工程，所有试验在完整副本中执行。
-- 参数采样前先复现一组已知 `model.in`；若结果不一致，应先检查基准文件、可执行文件和观测配置。
+- 参数采样前先确认权威基线是 `model.in`，还是已经烘焙到根目录的输入状态；若结果不一致，应先检查基准文件、可执行文件和观测配置。
 - 根据当前工程的 `fig.fig` 推导站点依赖关系，不能沿用其他流域的分区或上下游关系。
 - 仅率定真正位于测站本地或上游、能够影响该测站的水库；同子流域但位于测站下游的水库会被排除。
 - 各站点分别得到的最优参数不能直接拼接，必须通过一次全模型联合复现后才能接受。
 - 已知正确的点源、取水、水库调度和记录输入不能作为任意拟合参数。
 - 当 Swat_Edit 无法修改 `.sol`、`.wus` 或 `.res` 参数时，应将接受的固定值同步到工程根目录、`Backup/` 和存在的 `DirectBase/`。
 - GUI 正式工程应保留原始 BAT 文件、`Echo/` 和 Windows CRLF 控制文件，并在交付前清空正式 `SUFI2.OUT/`。
+- 每次提取前清空已有 `SUFI2.OUT/` 文件，防止旧版提取器把新时序追加到旧时序之后。
 
 ## 环境要求
 
@@ -83,7 +83,7 @@ skills/swatcup-auto-calibrator/scripts/swatcup_auto_runner.py
 
 ```powershell
 python skills/swatcup-auto-calibrator/scripts/audit_structure.py `
-  --project "D:\Projects\HHB\Project.Sufi2.SwatCup" `
+  --project "D:\SWATCUP\Example.Sufi2.SwatCup" `
   --out-dir ".\results\structure"
 ```
 
@@ -93,7 +93,7 @@ python skills/swatcup-auto-calibrator/scripts/audit_structure.py `
 
 ```powershell
 swatcup-auto single `
-  --project "D:\Projects\HHB\Project.Sufi2.SwatCup" `
+  --project "D:\SWATCUP\Example.Sufi2.SwatCup" `
   --model-in ".\best_model.in"
 ```
 
@@ -105,7 +105,7 @@ swatcup-auto single `
 
 ```powershell
 swatcup-auto sample `
-  --project "D:\Projects\HHB\Project.Sufi2.SwatCup" `
+  --project "D:\SWATCUP\Example.Sufi2.SwatCup" `
   --runs 200 `
   --max-attempts 240 `
   --workers 4 `
@@ -113,7 +113,7 @@ swatcup-auto sample `
   --center-model-in ".\best_model.in" `
   --scale 0.15 `
   --score-mode multisite_timeseries `
-  --variable-weights "FLOW_OUT_17=2,FLOW_OUT_60=2" `
+  --variable-weights "FLOW_OUT_101=2,FLOW_OUT_205=2" `
   --series-dir ".\results\series" `
   --out-csv ".\results\round1.csv"
 ```
@@ -126,7 +126,7 @@ swatcup-auto sample `
 
 ```powershell
 python skills/swatcup-auto-calibrator/scripts/build_95ppu.py `
-  --observed "D:\Projects\HHB\Project.Sufi2.SwatCup\SUFI2.IN\observed_rch.txt" `
+  --observed "D:\SWATCUP\Example.Sufi2.SwatCup\SUFI2.IN\observed_rch.txt" `
   --final-series-csv ".\results\series\run_42_series.csv" `
   --ensemble-dir ".\results\series" `
   --results-csv ".\results\round1.csv" `
@@ -142,16 +142,16 @@ python skills/swatcup-auto-calibrator/scripts/build_95ppu.py `
 
 ```powershell
 swatcup-auto reservoir-scope `
-  --project "D:\Projects\HHB\Project.Sufi2.SwatCup" `
-  --stations "17,60"
+  --project "D:\SWATCUP\Example.Sufi2.SwatCup" `
+  --stations "101,205"
 ```
 
 需要单独生成水库参数范围时：
 
 ```powershell
 swatcup-auto reservoir-scope `
-  --project "D:\Projects\HHB\Project.Sufi2.SwatCup" `
-  --stations "17,60" `
+  --project "D:\SWATCUP\Example.Sufi2.SwatCup" `
+  --stations "101,205" `
   --out-par-inf ".\results\reservoir_par_inf.txt" `
   --runs 200
 ```
@@ -167,7 +167,7 @@ swatcup-auto reservoir-scope `
 WUS 参数使用相同的月份语法，例如：
 
 ```text
-v__WURCH(7).wus________17
+v__WURCH(7).wus________101
 ```
 
 调整 WUS 前必须确认当前工程中的用水单位、实际取水记录和回归水设置。结构输入不应仅为提高统计指标而失去物理意义。
@@ -178,7 +178,7 @@ v__WURCH(7).wus________17
 
 ```powershell
 swatcup-auto plan `
-  --project "D:\Projects\HHB\Project.Sufi2.SwatCup" `
+  --project "D:\SWATCUP\Example.Sufi2.SwatCup" `
   --runs 1000 `
   --center-model-in ".\results\round1.best_model.in" `
   --scale 0.10 `
@@ -193,7 +193,7 @@ swatcup-auto plan `
 
 ```powershell
 python skills/swatcup-auto-calibrator/scripts/sync_baked_inputs.py `
-  --project "D:\Projects\HHB\Delivery.Sufi2.SwatCup" `
+  --project "D:\SWATCUP\Delivery.Sufi2.SwatCup" `
   --model-in ".\results\round1.best_model.in" `
   --dry-run
 ```
@@ -202,7 +202,7 @@ python skills/swatcup-auto-calibrator/scripts/sync_baked_inputs.py `
 
 ```powershell
 python skills/swatcup-auto-calibrator/scripts/sync_baked_inputs.py `
-  --project "D:\Projects\HHB\Delivery.Sufi2.SwatCup" `
+  --project "D:\SWATCUP\Delivery.Sufi2.SwatCup" `
   --model-in ".\results\round1.best_model.in"
 ```
 
@@ -214,8 +214,8 @@ python skills/swatcup-auto-calibrator/scripts/sync_baked_inputs.py `
 
 ```powershell
 python skills/swatcup-auto-calibrator/scripts/native_gui_check.py `
-  --project "D:\Projects\HHB\Delivery.Sufi2.SwatCup" `
-  --source-project "D:\Projects\HHB\Project.Sufi2.SwatCup" `
+  --project "D:\SWATCUP\Delivery.Sufi2.SwatCup" `
+  --source-project "D:\SWATCUP\Example.Sufi2.SwatCup" `
   --expected-formal-runs 1000 `
   --smoke-out ".\results\smoke\SUFI2.OUT" `
   --smoke-runs 3 `

@@ -6,27 +6,27 @@ Process-aware, GUI-free SWAT-CUP/SUFI2 calibration for multi-station projects.
 
 无需持续操作 SWAT-CUP 图形界面。工具可直接复现 `model.in`、在相互隔离的工程副本中采样、计算逐站 R2/NSE/KGE/PBIAS 与时序诊断指标，并准备可由原生 BAT 和 GUI 继续运行的工程。
 
-## Version 1.1.1
+## Version 1.4.0
 
-1.1.1 clears root-level SWAT outputs before every simulation. This fixes reused workers whose later samples could disagree with a clean replay even when parameter inputs and `DirectBase/` were identical.
-
-The 1.1 series expands the original runner into a complete calibration and delivery workflow:
+Version 1.4.0 expands the runner into an adaptive, multi-constraint calibration and native-delivery workflow:
 
 - Multi-station process diagnostics: correlation, log-NSE, monthly climatology, lag, peak offset, peak capture, low-flow ratio, and false-zero detection.
-- Saved per-run hydrographs and strict station-specific 95PPU ensemble construction.
-- `fig.fig` topology audit for station dependencies, record inputs, `.wus` withdrawals, and local/upstream reservoirs.
-- Conservative joint `.wus`/`.res` calibration. Monthly reservoir targets, outflow limits, and withdrawals keep their seasonal structure instead of being flattened to one annual value.
-- Per-station weights and NSE/KGE acceptance thresholds for candidate selection.
-- Failed-run accounting and retry limits so a requested sample count means successful simulations.
-- Native GUI project checks, baked-input synchronization, and BAT smoke-test validation.
+- Adaptive batches with recovery of complete results from interrupted runs.
+- Flow/sediment class weights, per-variable weights, acceptance floors, and whole-model replay before combining local optima.
+- Saved per-run process series and strict, station-specific 95PPU construction using the original observation indices.
+- `fig.fig` topology and extraction audits for dependencies, record inputs, `.wus` withdrawals, transfers, and local/upstream reservoirs.
+- Conservative `.wus`/`.res` calibration that preserves monthly seasonality and physically meaningful bounds.
+- Explicit parameter-clipping receipts so requested and applied values cannot silently diverge.
+- Native GUI checks for formal matrix dimensions, CRLF controls, real editor changes, tail-parameter truncation, and empty formal `SUFI2.OUT/`.
+- Extraction-state safeguards for legacy tools that append to existing output series.
 
-1.1.0 removes the old basin-specific `sediment` and `hhb_flow` score modes. Use equal or explicit variable weights with `kge`, or use `multisite_timeseries` for process-aware multi-station search.
+Legacy basin-specific score modes are not supported. Use equal or explicit variable weights with `kge`, or `multisite_timeseries` for process-aware monthly searches.
 
 ## Safety Model
 
 SWAT and SUFI2 write fixed file names. Never run concurrent simulations in one project directory. Each worker receives a full project copy, restores the files touched by the active parameter set, and clears generated SWAT outputs before every run so reused workers remain replayable.
 
-Keep the source project unchanged. Reproduce one known parameter set before sampling, derive station and reservoir scope from the current `fig.fig`, and replay the selected whole-model combination before delivery. Direct-only `.sol`, `.wus`, and `.res` edits should be baked into the root project, `Backup/`, and `DirectBase/` when the installed Swat_Edit cannot change them.
+Keep the source project unchanged. Confirm whether the accepted state is an authoritative `model.in` or an already baked root project, derive station and reservoir scope from the current `fig.fig`, and replay the selected whole-model combination before delivery. Clear `SUFI2.OUT/` before extraction because legacy extractors may append to existing series. Direct-only `.sol`, `.wus`, and `.res` edits should be baked into the root project, `Backup/`, and `DirectBase/` when the installed Swat_Edit cannot change them.
 
 ## Requirements
 
@@ -51,7 +51,7 @@ Audit topology and structural inputs:
 
 ```powershell
 python skills/swatcup-auto-calibrator/scripts/audit_structure.py `
-  --project "D:\Projects\HHB\Project.Sufi2.SwatCup" `
+  --project "D:\SWATCUP\Example.Sufi2.SwatCup" `
   --out-dir ".\results\structure"
 ```
 
@@ -59,7 +59,7 @@ Reproduce a known parameter set:
 
 ```powershell
 swatcup-auto single `
-  --project "D:\Projects\HHB\Project.Sufi2.SwatCup" `
+  --project "D:\SWATCUP\Example.Sufi2.SwatCup" `
   --model-in ".\best_model.in"
 ```
 
@@ -67,7 +67,7 @@ Run 200 successful samples in four isolated workers, allowing up to 240 attempts
 
 ```powershell
 swatcup-auto sample `
-  --project "D:\Projects\HHB\Project.Sufi2.SwatCup" `
+  --project "D:\SWATCUP\Example.Sufi2.SwatCup" `
   --runs 200 `
   --max-attempts 240 `
   --workers 4 `
@@ -75,7 +75,7 @@ swatcup-auto sample `
   --center-model-in ".\best_model.in" `
   --scale 0.15 `
   --score-mode multisite_timeseries `
-  --variable-weights "FLOW_OUT_17=2,FLOW_OUT_60=2" `
+  --variable-weights "FLOW_OUT_101=2,FLOW_OUT_205=2" `
   --series-dir ".\results\series" `
   --out-csv ".\results\round1.csv"
 ```
@@ -86,7 +86,7 @@ Build station-specific 95PPU diagnostics from complete successful runs:
 
 ```powershell
 python skills/swatcup-auto-calibrator/scripts/build_95ppu.py `
-  --observed "D:\Projects\HHB\Project.Sufi2.SwatCup\SUFI2.IN\observed_rch.txt" `
+  --observed "D:\SWATCUP\Example.Sufi2.SwatCup\SUFI2.IN\observed_rch.txt" `
   --final-series-csv ".\results\series\run_42_series.csv" `
   --ensemble-dir ".\results\series" `
   --results-csv ".\results\round1.csv" `
@@ -100,23 +100,23 @@ Report only reservoirs local to or upstream of selected observation stations:
 
 ```powershell
 swatcup-auto reservoir-scope `
-  --project "D:\Projects\HHB\Project.Sufi2.SwatCup" `
-  --stations "17,60"
+  --project "D:\SWATCUP\Example.Sufi2.SwatCup" `
+  --stations "101,205"
 ```
 
 Write conservative reservoir parameter rows when a separate range file is useful:
 
 ```powershell
 swatcup-auto reservoir-scope `
-  --project "D:\Projects\HHB\Project.Sufi2.SwatCup" `
-  --stations "17,60" `
+  --project "D:\SWATCUP\Example.Sufi2.SwatCup" `
+  --stations "101,205" `
   --out-par-inf ".\results\reservoir_par_inf.txt" `
   --runs 200
 ```
 
 Monthly `STARG(month)`, `OFLOWMN(month)`, `OFLOWMX(month)`, and `WURESN(month)` ranges are centered on the current month. Existing minimum/maximum outflow ordering is preserved by the generated ranges. The command does not sample reservoir operating modes such as `IRESCO` by default.
 
-`.wus` parameters use the same syntax, for example `v__WURCH(7).wus________17`. Verify project-specific WUS units and physical records before treating withdrawals as calibration variables.
+`.wus` parameters use the same syntax, for example `v__WURCH(7).wus________101`. Verify project-specific WUS units and physical records before treating withdrawals as calibration variables.
 
 ## GUI Planning And Delivery
 
@@ -124,7 +124,7 @@ Generate a GUI `par_val.txt` plan with the exact accepted center in row 1:
 
 ```powershell
 swatcup-auto plan `
-  --project "D:\Projects\HHB\Project.Sufi2.SwatCup" `
+  --project "D:\SWATCUP\Example.Sufi2.SwatCup" `
   --runs 1000 `
   --center-model-in ".\results\round1.best_model.in" `
   --scale 0.10 `
@@ -135,12 +135,12 @@ Review and synchronize accepted direct-only files:
 
 ```powershell
 python skills/swatcup-auto-calibrator/scripts/sync_baked_inputs.py `
-  --project "D:\Projects\HHB\Delivery.Sufi2.SwatCup" `
+  --project "D:\SWATCUP\Delivery.Sufi2.SwatCup" `
   --model-in ".\results\round1.best_model.in" `
   --dry-run
 
 python skills/swatcup-auto-calibrator/scripts/sync_baked_inputs.py `
-  --project "D:\Projects\HHB\Delivery.Sufi2.SwatCup" `
+  --project "D:\SWATCUP\Delivery.Sufi2.SwatCup" `
   --model-in ".\results\round1.best_model.in"
 ```
 
@@ -148,8 +148,8 @@ Validate the formal project after its native Pre/Run/Post BAT smoke test:
 
 ```powershell
 python skills/swatcup-auto-calibrator/scripts/native_gui_check.py `
-  --project "D:\Projects\HHB\Delivery.Sufi2.SwatCup" `
-  --source-project "D:\Projects\HHB\Project.Sufi2.SwatCup" `
+  --project "D:\SWATCUP\Delivery.Sufi2.SwatCup" `
+  --source-project "D:\SWATCUP\Example.Sufi2.SwatCup" `
   --expected-formal-runs 1000 `
   --smoke-out ".\results\smoke\SUFI2.OUT" `
   --smoke-runs 3 `
